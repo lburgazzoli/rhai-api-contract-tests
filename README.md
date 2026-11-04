@@ -6,7 +6,8 @@ Shared CI contract tests for RHOAI and ODH provider repositories, hosted at
 `api-contract-tests` is the canonical home for the reusable compatibility runner,
 descriptor schemas, provider workflows, and onboarding guides. Provider
 repositories keep their canonical OpenAPI documents, CRDs, and behavior tests;
-this repository supplies the shared checks and result format.
+consumer repositories keep their reliance profiles and consumer-side tests. This
+repository supplies the shared checks and result format.
 
 ## Current status
 
@@ -20,7 +21,10 @@ this repository supplies the shared checks and result format.
   workflows to a release tag (`@v0.1.0`), `@stable`, `@latest` or a full commit
   SHA; see [releases and pinning](docs/releasing.md). Check each provider
   repository's workflow for whether it has been wired in yet.
-- CRD conversion, stored-object migration, and consumer-reliance checks are follow-on work.
+- Consumer onboarding is repository-local today: the consumer owns the reliance
+  profile and tests. See the [consumer guide](docs/onboarding/consumer-compat.md).
+- CRD conversion, stored-object migration, and shared consumer-reliance
+  verification are follow-on work.
 
 ## Quick start
 
@@ -65,6 +69,9 @@ python3 /path/to/api-contract-tests/cmd/contract-tests/cli.py crd-check \
 See [CRD onboarding](docs/onboarding/crd-compat.md) for the initial static
 policy and the remaining cluster-backed follow-on work.
 
+For the consumer side, start with the
+[consumer onboarding guide](docs/onboarding/consumer-compat.md).
+
 ## Repository layout
 
 ```text
@@ -74,10 +81,10 @@ policy and the remaining cluster-backed follow-on work.
 ├── modules/crd-compat/       # Static CRD compatibility engine
 ├── modules/coverage/         # Coverage check and repository discovery
 ├── schemas/                  # ContractSet descriptor schema
-├── .claude/skills/           # Assistant skill that walks an onboarding
+├── .claude/skills/           # Assistant skills for provider and consumer onboarding
 ├── docs/
 │   ├── architecture.md       # Ownership and enforcement model
-│   ├── onboarding/           # Provider onboarding checklist and guides
+│   ├── onboarding/           # Provider and consumer onboarding checklists and guides
 │   ├── releasing.md          # Pinning options and the release process
 │   └── research/             # CRD and follow-on research
 └── .github/workflows/        # CI and provider workflows
