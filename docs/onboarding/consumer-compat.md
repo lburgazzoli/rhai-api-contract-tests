@@ -207,11 +207,16 @@ jobs:
       contract-set: packages/model-registry/.rhoai/contracts.yaml
       contract-id: model-registry-bff-model-catalog-v1
       baseline-refs: ${{ github.event.pull_request.base.sha }}
+      oasdiff-version: "1.33.0"
+      yq-version: "4.45.1"
       mode: report
 
   upstream-main:
     name: BFF contract vs upstream main
     runs-on: ubuntu-latest
+    # Report mode: a failed assertion annotates the run but does not block a
+    # merge. Remove this once the owners move the relationship to enforce.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@<pinned-sha>
       - run: pnpm --filter @odh-dashboard/model-registry test:contract
