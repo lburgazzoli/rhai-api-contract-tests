@@ -1,11 +1,19 @@
 # Onboarding a repository
 
-This is the end-to-end path for putting a provider repository under the shared
-contract checks. The detailed guides are linked from each step. Rollout is
-opt-in: nothing here is a promotion gate, and every check starts in report
-mode.
+This repository has two onboarding paths. Choose the one that matches what your
+repository owns:
 
-## What you are adding
+| Your role | What you own | Start here |
+|---|---|---|
+| Provider | The canonical OpenAPI document or CRDs, provider behavior tests, and the `ContractSet` descriptor | [Provider checklist](#provider-checklist), then the [OpenAPI](openapi-compat.md) or [CRD](crd-compat.md) guide |
+| Consumer | The reliance profile, consumer-side contract tests, and the CI job that runs them | [Consumer guide](consumer-compat.md) and [Consumer checklist](#consumer-checklist) |
+
+Provider rollout is opt-in: nothing here is a promotion gate, and every check
+starts in report mode. Consumer reliance checks are repository-local today; the
+consumer guide records the profile and tests that the follow-on shared verifier
+will adopt.
+
+## What a provider adds
 
 | Piece | Where it lives in your repository | Purpose |
 |---|---|---|
@@ -16,7 +24,7 @@ mode.
 Your repository keeps its canonical OpenAPI documents and CRDs. This
 repository supplies the runner, schemas, and reusable workflows.
 
-## Checklist
+## Provider checklist
 
 1. **Inventory what you have.** From a checkout of this repository:
 
@@ -71,6 +79,39 @@ repository supplies the runner, schemas, and reusable workflows.
 
 8. **Register the contract** with the working group
    ([step 6 of the OpenAPI guide](openapi-compat.md#6-register-the-contract-with-the-working-group)).
+
+## Consumer checklist
+
+1. **Identify the provider contract.** Record the provider repository, contract
+   ID, declared artifact path, owner, support level, and an immutable full-SHA
+   baseline. If the provider has not registered a contract, start with the
+   [provider checklist](#provider-checklist) instead.
+
+2. **Inventory the consumer's reliance.** Use code and tests to list the
+   operations, parameters, response fields, status codes, error shapes, and
+   behavior the consumer actually uses. Mark unknowns rather than guessing.
+
+3. **Write the reliance profile.** Put `.rhoai/consumer-profile.yaml` in the
+   consumer repository using the shape in the [consumer guide](consumer-compat.md#3-write-the-reliance-profile).
+   The shared runner does not consume it yet; it is the reviewable record for
+   the follow-on verifier.
+
+4. **Add consumer contract tests.** Exercise the real consumer boundary, validate
+   the response against the provider OpenAPI document, and assert the fields,
+   statuses, and behavior named in the profile. See the
+   [Dashboard reference implementation](consumer-compat.md#dashboard-reference-implementation).
+
+5. **Run against a pinned provider.** Record the provider SHA, test command, tool
+   versions, and result. Run against provider `main` as a separate drift signal;
+   do not record `main` as the baseline.
+
+6. **Add report-mode CI.** Run the consumer tests on consumer changes and
+   provider syncs. Pin any reusable workflow to a release tag or full SHA, never
+   a branch. See [consumer CI](consumer-compat.md#6-add-ci-in-report-mode).
+
+7. **Register the relationship.** Provide the provider contract, consumer
+   profile, test command, CI workflow, owners, support level, and known gaps to
+   the working group.
 
 ## Choosing a baseline
 
@@ -131,7 +172,13 @@ repository, not something this repository does for you.
 
 ## Using an assistant
 
-`.claude/skills/onboard-api-contracts/SKILL.md` encodes steps 1–6 for Claude
-Code: it runs `discover`, drafts the descriptor, asks you the scoping and
-baseline questions, runs the checks and `coverage`, and prepares the workflow.
-It never opens a pull request or pushes without being asked.
+Two assistant skills encode these paths:
+
+- `.claude/skills/onboard-api-contracts/SKILL.md` covers the provider path. It
+  runs `discover`, drafts the descriptor, asks the scoping and baseline
+  questions, runs the checks and `coverage`, and prepares the workflow.
+- `.claude/skills/onboard-consumer-contracts/SKILL.md` covers the consumer path.
+  It inventories reliance from code and tests, drafts the profile, verifies the
+  consumer tests, and prepares report-mode CI.
+
+Both skills stop before pushing or opening a pull request unless you ask.

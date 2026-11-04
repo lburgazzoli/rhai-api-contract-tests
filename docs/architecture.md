@@ -42,3 +42,7 @@ unpinned tools, and missing required results must not produce a silent pass.
 - Static CRD compatibility is implemented.
 - CRD conversion, stored-object migration, and consumer-reliance checks are follow-on work.
 - Protobuf and additional contract types are follow-on work.
+
+Consumer repositories can record their reliance profile and consumer-side tests
+now using the [consumer onboarding guide](onboarding/consumer-compat.md); shared
+consumer-profile verification is the follow-on automation.
