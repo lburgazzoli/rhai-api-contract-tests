@@ -40,6 +40,10 @@ unpinned tools, and missing required results must not produce a silent pass.
 
 - OpenAPI compatibility is implemented.
 - Static CRD compatibility is implemented.
+- Static Kubernetes manifest compatibility is implemented: rendered
+  raw/Helm/Kustomize scenarios compared against full-SHA Git baselines, with
+  immutable-field and relationship rules source-audited against Kubernetes
+  1.35–1.37. Custom resources stay the CRD check's responsibility.
 - CRD conversion, stored-object migration, and consumer-reliance checks are follow-on work.
 - Protobuf and additional contract types are follow-on work.
 

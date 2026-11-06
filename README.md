@@ -13,6 +13,10 @@ repository supplies the shared checks and result format.
 
 - The OpenAPI compatibility module is implemented and tested.
 - The initial static CRD compatibility module is implemented and tested.
+- The static Kubernetes manifest compatibility module is implemented and
+  tested: rendered raw/Helm/Kustomize scenarios compared against full-SHA Git
+  baselines with source-audited immutability rules. See the
+  [manifest onboarding guide](docs/onboarding/manifest-compat.md).
 - The coverage check (`coverage`) confirms every OpenAPI document and CRD in a
   repository is registered; `discover` inventories a repository for onboarding.
 - The local runner is `cmd/contract-tests/cli.py`.
@@ -69,6 +73,26 @@ python3 /path/to/api-contract-tests/cmd/contract-tests/cli.py crd-check \
 See [CRD onboarding](docs/onboarding/crd-compat.md) for the initial static
 policy and the remaining cluster-backed follow-on work.
 
+For a provider that installs through raw manifests, Helm, or Kustomize:
+
+```bash
+# Once, with network: fetch the pinned renderer tools into a cache outside
+# any checkout (needs Go >= 1.27 on PATH).
+python3 /path/to/api-contract-tests/cmd/contract-tests/cli.py manifest-prepare \
+  --repo . --manifest-set .rhoai/manifests.yaml --tool-cache-dir /tmp/manifest-tools
+
+# Offline, on every change:
+python3 /path/to/api-contract-tests/cmd/contract-tests/cli.py manifest-check \
+  --repo . \
+  --manifest-set .rhoai/manifests.yaml \
+  --baseline-ref <full-git-sha> \
+  --output-dir /tmp/manifest-report \
+  --tool-cache-dir /tmp/manifest-tools
+```
+
+See the [manifest onboarding guide](docs/onboarding/manifest-compat.md) for
+scenario descriptors, baseline declarations, and report semantics.
+
 For the consumer side, start with the
 [consumer onboarding guide](docs/onboarding/consumer-compat.md).
 
@@ -79,8 +103,9 @@ For the consumer side, start with the
 ├── cmd/contract-tests/       # Local runner
 ├── modules/openapi-compat/   # OpenAPI compatibility engine
 ├── modules/crd-compat/       # Static CRD compatibility engine
+├── modules/manifest-compat/  # Kubernetes manifest compatibility engine
 ├── modules/coverage/         # Coverage check and repository discovery
-├── schemas/                  # ContractSet descriptor schema
+├── schemas/                  # ContractSet and ManifestSet descriptor schemas
 ├── .claude/skills/           # Assistant skills for provider and consumer onboarding
 ├── docs/
 │   ├── architecture.md       # Ownership and enforcement model
@@ -100,8 +125,14 @@ For the consumer side, start with the
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-OASDIFF=/path/to/oasdiff YQ=/path/to/yq python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests -v
+OASDIFF=/path/to/oasdiff YQ=/path/to/yq python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests modules/manifest-compat/tests -v
 ```
+
+The manifest module's real-renderer integration tests are excluded from that
+invocation (they need a prepared Go tool cache); the repository-root
+`pytest.ini` registers the `manifest_renderers` marker and excludes it by
+default. Run them explicitly after preparing the cache, as described in the
+[module README](modules/manifest-compat/README.md#tests).
 
 CI also lints the workflows with [actionlint](https://github.com/rhysd/actionlint)
 v1.7.12 (settings in `.github/actionlint.yaml`) and checks that every action's
@@ -122,9 +153,9 @@ for file in cmd/contract-tests/cli.py modules/*/*.py; do python3 -m mypy "$file"
 
 The provider workflows keep their logic in `cmd/workflow-steps/steps.py`
 (tested by `cmd/workflow-steps/tests`); the YAML only wires steps together. The
-`Workflow self-test` workflow (`.github/workflows/self-test.yml`) runs all three
-provider workflows end to end on every pull request, against the fixture provider
-in [`selftest/`](selftest/README.md).
+`Workflow self-test` workflow (`.github/workflows/self-test.yml`) runs every
+provider workflow end to end on every pull request, against the fixture
+provider in [`selftest/`](selftest/README.md).
 
 The test suite requires `oasdiff` v1.33.0 and `yq` v4.45.1:
 
