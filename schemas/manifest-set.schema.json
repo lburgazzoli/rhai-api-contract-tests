@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rhoai.io/schemas/manifest-set.schema.json",
+  "title": "ManifestSet",
+  "description": "A provider-owned descriptor registering named render scenarios (raw YAML, Helm, or Kustomize) for the Kubernetes manifest compatibility check. Points at local sources and declares scenario settings, baseline cases, protected contracts, and finding exceptions; never copies rendered content. See docs/onboarding/manifest-compat.md.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "contracts.rhoai.io/v1alpha1" },
+    "kind": { "const": "ManifestSet" },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "spec": {
+      "type": "object",
+      "required": ["scenarios"],
+      "properties": {
+        "tools": {
+          "type": "object",
+          "description": "Renderer pins. A tool is only required when a selected scenario uses its renderer; when tools is declared, both pins are mandatory and must match the supported versions exactly.",
+          "required": ["helmVersion", "kustomizeVersion"],
+          "properties": {
+            "helmVersion": { "const": "4.3.1" },
+            "kustomizeVersion": { "const": "5.8.3" }
+          },
+          "additionalProperties": false
+        },
+        "scenarios": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/scenario" }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$",
+      "description": "Full Git SHA. Mutable refs (branches, tags, HEAD) are rejected."
+    },
+    "jsonPointer": {
+      "type": "string",
+      "pattern": "^(\\/([^\\/~]|~[01])*)*$",
+      "description": "RFC 6901 JSON Pointer; the empty string addresses the whole document."
+    },
+    "identity": {
+      "type": "object",
+      "description": "Exact resource identity. The core group is the empty string; cluster-scoped resources use the empty namespace. No wildcards.",
+      "required": ["group", "kind", "namespace", "name"],
+      "properties": {
+        "group": { "type": "string" },
+        "kind": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string" },
+        "name": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "rawSources": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Repo-relative YAML globs selecting raw manifests."
+    },
+    "valuesFiles": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Repo-relative, ordered Helm values files."
+    },
+    "setValues": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "String values applied with --set-string on both revisions."
+    },
+    "baselineCase": {
+      "type": "object",
+      "required": ["ref", "state"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/sha" },
+        "state": { "enum": ["new", "existing"] },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required for state new: why no historical input exists at this baseline."
+        },
+        "inputs": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Required for state existing: overrides for historical input locations. May change only path, raw sources, and valuesFiles.",
+          "properties": {
+            "path": { "type": "string", "minLength": 1 },
+            "sources": { "$ref": "#/$defs/rawSources" },
+            "valuesFiles": { "$ref": "#/$defs/valuesFiles" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "new" } }, "required": ["state"] },
+          "then": { "required": ["reason"], "not": { "required": ["inputs"] } }
+        },
+        {
+          "if": { "properties": { "state": { "const": "existing" } }, "required": ["state"] },
+          "then": { "required": ["inputs"], "not": { "required": ["reason"] } }
+        }
+      ]
+    },
+    "kindScope": {
+      "type": "object",
+      "description": "Explicit scope for a kind absent from the built-in scope table and rendered CRDs.",
+      "required": ["group", "kind", "scope"],
+      "properties": {
+        "group": { "type": "string" },
+        "kind": { "type": "string", "minLength": 1 },
+        "scope": { "enum": ["Namespaced", "Cluster"] }
+      },
+      "additionalProperties": false
+    },
+    "protectedLabel": {
+      "type": "object",
+      "description": "A labels map (by JSON Pointer location) whose baseline key/value pairs are a declared contract.",
+      "required": ["location", "keys"],
+      "properties": {
+        "location": { "$ref": "#/$defs/jsonPointer" },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "exception": {
+      "type": "object",
+      "description": "Suppresses exactly one baseline-comparison finding tuple. Relational rules additionally require relatedResource and edgeId; nonrelational rules forbid them.",
+      "required": ["ruleId", "resource", "path", "baselineRef", "reason"],
+      "properties": {
+        "ruleId": { "type": "string", "minLength": 1 },
+        "resource": { "$ref": "#/$defs/identity" },
+        "path": { "$ref": "#/$defs/jsonPointer" },
+        "baselineRef": { "$ref": "#/$defs/sha" },
+        "reason": { "type": "string", "minLength": 1 },
+        "relatedResource": { "$ref": "#/$defs/identity" },
+        "edgeId": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 edge ID copied verbatim from the finding being waived."
+        }
+      },
+      "additionalProperties": false
+    },
+    "scenario": {
+      "type": "object",
+      "required": ["id", "renderer", "namespace", "kubernetesVersion"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "renderer": { "enum": ["raw", "helm", "kustomize"] },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "description": "Explicit scenario namespace; used for namespaced objects without their own metadata.namespace."
+        },
+        "kubernetesVersion": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "Full semantic Kubernetes version (X.Y.Z) this scenario targets."
+        },
+        "apiVersions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Extra apiVersions passed to the renderer (Helm --api-versions); default []."
+        },
+        "sources": { "$ref": "#/$defs/rawSources" },
+        "path": { "type": "string", "minLength": 1 },
+        "releaseName": { "type": "string", "minLength": 1 },
+        "valuesFiles": { "$ref": "#/$defs/valuesFiles" },
+        "setValues": { "$ref": "#/$defs/setValues" },
+        "releaseMode": { "enum": ["upgrade", "install"] },
+        "baselineCases": { "type": "array", "items": { "$ref": "#/$defs/baselineCase" } },
+        "kindScopes": { "type": "array", "items": { "$ref": "#/$defs/kindScope" } },
+        "protectedLabels": { "type": "array", "items": { "$ref": "#/$defs/protectedLabel" } },
+        "protectedResources": { "type": "array", "items": { "$ref": "#/$defs/identity" } },
+        "exceptions": { "type": "array", "items": { "$ref": "#/$defs/exception" } }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "renderer": { "const": "raw" } }, "required": ["renderer"] },
+          "then": {
+            "required": ["sources"],
+            "not": {
+              "anyOf": [
+                { "required": ["path"] },
+                { "required": ["releaseName"] },
+                { "required": ["valuesFiles"] },
+                { "required": ["setValues"] },
+                { "required": ["releaseMode"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": { "properties": { "renderer": { "const": "helm" } }, "required": ["renderer"] },
+          "then": {
+            "required": ["path", "releaseName"],
+            "not": { "required": ["sources"] }
+          }
+        },
+        {
+          "if": { "properties": { "renderer": { "const": "kustomize" } }, "required": ["renderer"] },
+          "then": {
+            "required": ["path"],
+            "not": {
+              "anyOf": [
+                { "required": ["sources"] },
+                { "required": ["releaseName"] },
+                { "required": ["valuesFiles"] },
+                { "required": ["setValues"] },
+                { "required": ["releaseMode"] }
+              ]
+            }
+          }
+        },
+        {
+          "if": { "properties": { "renderer": { "const": "raw" } }, "required": ["renderer"] },
+          "then": {
+            "properties": {
+              "baselineCases": {
+                "items": {
+                  "properties": {
+                    "inputs": {
+                      "not": {
+                        "anyOf": [
+                          { "required": ["path"] },
+                          { "required": ["valuesFiles"] }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "renderer": { "const": "helm" } }, "required": ["renderer"] },
+          "then": {
+            "properties": {
+              "baselineCases": {
+                "items": {
+                  "properties": {
+                    "inputs": { "not": { "required": ["sources"] } }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "renderer": { "const": "kustomize" } }, "required": ["renderer"] },
+          "then": {
+            "properties": {
+              "baselineCases": {
+                "items": {
+                  "properties": {
+                    "inputs": {
+                      "not": {
+                        "anyOf": [
+                          { "required": ["sources"] },
+                          { "required": ["valuesFiles"] }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
