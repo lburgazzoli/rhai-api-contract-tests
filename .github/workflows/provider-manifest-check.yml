@@ -1,0 +1,97 @@
+name: Provider manifest compatibility check
+
+on:
+  workflow_call:
+    inputs:
+      manifest-set:
+        description: Repository-relative path to the ManifestSet descriptor
+        required: false
+        type: string
+        default: .rhoai/manifests.yaml
+      scenario-id:
+        description: Run a single scenario by id; default runs every scenario
+        required: false
+        type: string
+      mode:
+        description: report or enforce
+        required: false
+        type: string
+        default: report
+      baseline-refs:
+        description: Space-separated full Git SHAs
+        required: true
+        type: string
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out provider repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Check out contract-tests
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .contract-tests
+
+      # Callers must pin this workflow by full commit SHA or release tag; see require_pinned_ref in steps.py.
+      - name: Require a pinned reusable-workflow ref
+        env:
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+        run: python3 .contract-tests/cmd/workflow-steps/steps.py require-pinned-ref
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      # Go 1.27 satisfies both pinned renderer modules (Kustomize requires >= 1.27).
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.27"
+
+      - name: Install pinned YAML parser
+        run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
+
+      # The only network-enabled step: fetch and verify the pinned go-run renderer
+      # modules into a cache outside the checkout. Raw-only selections prepare nothing.
+      - name: Prepare renderer tool cache
+        env:
+          MANIFEST_SET: ${{ inputs.manifest-set }}
+          SCENARIO_ID: ${{ inputs.scenario-id }}
+          TOOL_CACHE_DIR: ${{ runner.temp }}/manifest-tool-cache
+        run: python3 .contract-tests/cmd/workflow-steps/steps.py prepare manifest
+
+      # Strictly offline: the checker disables the module proxy itself and only
+      # reuses the cache prepared above; it never downloads tools or provider content.
+      - name: Run manifest compatibility check
+        env:
+          MANIFEST_SET: ${{ inputs.manifest-set }}
+          SCENARIO_ID: ${{ inputs.scenario-id }}
+          MODE: ${{ inputs.mode }}
+          BASELINE_REFS: ${{ inputs.baseline-refs }}
+          TOOL_CACHE_DIR: ${{ runner.temp }}/manifest-tool-cache
+        run: python3 .contract-tests/cmd/workflow-steps/steps.py run manifest
+
+      - name: Summarize compatibility result
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: python3 .contract-tests/cmd/workflow-steps/steps.py summarize manifest
+
+      - name: Archive report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifest-contract-report-${{ inputs.scenario-id || 'all' }}
+          path: .contract-report
+          include-hidden-files: true

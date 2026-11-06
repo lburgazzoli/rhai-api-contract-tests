@@ -38,7 +38,7 @@ jobs:
         run: |
           # Each module directory has its own checker.py, which mypy cannot check in one run.
           failed=0
-          for file in cmd/contract-tests/cli.py modules/*/*.py; do
+          for file in cmd/contract-tests/cli.py cmd/workflow-steps/steps.py modules/*/*.py; do
             python3 -m mypy "$file" || failed=1
           done
           exit "$failed"
@@ -49,7 +49,7 @@ jobs:
           YQ: ${{ github.workspace }}/bin/yq
         run: |
           python3 -m compileall cmd modules
-          python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests -v
+          python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests modules/manifest-compat/tests -v
 
   workflow-lint:
     runs-on: ubuntu-latest

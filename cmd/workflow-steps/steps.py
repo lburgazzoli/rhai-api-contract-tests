@@ -6,10 +6,15 @@ repository at its own commit and calls one subcommand per step. Inputs arrive as
 environment variables, exactly as the workflow passes them:
 
     steps.py require-pinned-ref       WORKFLOW_REF, WORKFLOW_SHA, WORKFLOW_REPOSITORY, CALLER_REPOSITORY
-    steps.py run {openapi,crd,coverage}
+    steps.py run {openapi,crd,coverage,manifest}
                                       MODE, BASELINE_REFS, and per check: CONTRACT_SET,
-                                      CONTRACT_ID, CRD_GLOB, CRD_GLOBS, CRD_EXCLUDE_GLOBS
-    steps.py summarize {openapi,crd}  report at .contract-report/report.json
+                                      CONTRACT_ID, CRD_GLOB, CRD_GLOBS, CRD_EXCLUDE_GLOBS,
+                                      MANIFEST_SET, SCENARIO_ID, TOOL_CACHE_DIR
+    steps.py prepare manifest         MANIFEST_SET, SCENARIO_ID, TOOL_CACHE_DIR
+                                      (the only network-enabled step: populates the pinned
+                                      go-run renderer cache that run manifest reuses offline)
+    steps.py summarize {openapi,crd,manifest}
+                                      report at .contract-report/report.json
     steps.py annotate-coverage        MODE, report at $RUNNER_TEMP/coverage.json
 
 Markdown goes to the job summary ($GITHUB_STEP_SUMMARY; stdout when unset).
@@ -26,7 +31,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TextIO
 
 CLI = Path(__file__).resolve().parents[1] / "contract-tests" / "cli.py"
@@ -122,6 +127,52 @@ def _baseline_args(env: Mapping[str, str]) -> list[str]:
     return args
 
 
+def _required_baseline_args(env: Mapping[str, str]) -> list[str]:
+    if not env.get("BASELINE_REFS", "").split():
+        raise InputError("baseline-refs is required")
+    return _baseline_args(env)
+
+
+def _manifest_set(env: Mapping[str, str]) -> str:
+    """The ManifestSet descriptor path, defaulting to .rhoai/manifests.yaml."""
+    manifest_set = (env.get("MANIFEST_SET") or "").strip() or ".rhoai/manifests.yaml"
+    path = PurePosixPath(manifest_set)
+    if path.is_absolute() or ".." in path.parts:
+        raise InputError(f"manifest-set must be a repository-relative path, not {manifest_set!r}")
+    return manifest_set
+
+
+def _scenario_id(env: Mapping[str, str]) -> str | None:
+    scenario_id = (env.get("SCENARIO_ID") or "").strip()
+    if not scenario_id:
+        return None
+    if any(character.isspace() for character in scenario_id):
+        raise InputError(f"scenario-id must name exactly one scenario, not {scenario_id!r}")
+    return scenario_id
+
+
+def _tool_cache_dir(env: Mapping[str, str], workspace: Path, *, required: bool) -> Path | None:
+    """The renderer tool cache location, which must stay outside the checkout.
+
+    The candidate snapshot scans untracked checkout files, so a cache inside
+    the workspace would corrupt every comparison; keep it in $RUNNER_TEMP.
+    """
+    raw = (env.get("TOOL_CACHE_DIR") or "").strip()
+    if not raw:
+        if required:
+            raise InputError("tool-cache-dir is required for manifest preparation")
+        return None
+    base = Path(raw) if Path(raw).is_absolute() else workspace / raw
+    cache = Path(os.path.abspath(str(base)))
+    checkout = Path(os.path.abspath(str(workspace)))
+    if cache == checkout or checkout in cache.parents:
+        raise InputError(
+            "tool cache must live outside the provider checkout so it is never scanned as "
+            f"repository content: {raw!r}"
+        )
+    return cache
+
+
 def check_args(check: str, env: Mapping[str, str], workspace: Path) -> list[str]:
     """The cli.py arguments for one check, built from the workflow's inputs.
 
@@ -154,6 +205,29 @@ def check_args(check: str, env: Mapping[str, str], workspace: Path) -> list[str]
             args.append("--report-only")
         # The JSON copy stays outside the checkout so it is never scanned as a repository file.
         return args + ["--json-output", str(coverage_report(env))]
+    if check == "manifest":
+        args = ["manifest-check", "--repo", str(workspace), "--manifest-set", _manifest_set(env)]
+        scenario_id = _scenario_id(env)
+        if scenario_id:
+            args += ["--scenario-id", scenario_id]
+        args += _required_baseline_args(env)
+        args += ["--output-dir", report_dir]
+        cache = _tool_cache_dir(env, workspace, required=False)
+        if cache is not None:
+            args += ["--tool-cache-dir", str(cache)]
+        # Rendering is strictly offline; the cache was prepared by `prepare manifest`.
+        return args + (["--enforce"] if mode == "enforce" else [])
+    raise InputError(f"unknown check {check!r}")
+
+
+def prepare_args(check: str, env: Mapping[str, str], workspace: Path) -> list[str]:
+    """The cli.py arguments for one preparation step (network-enabled)."""
+    if check == "manifest":
+        args = ["manifest-prepare", "--repo", str(workspace), "--manifest-set", _manifest_set(env)]
+        scenario_id = _scenario_id(env)
+        if scenario_id:
+            args += ["--scenario-id", scenario_id]
+        return args + ["--tool-cache-dir", str(_tool_cache_dir(env, workspace, required=True))]
     raise InputError(f"unknown check {check!r}")
 
 
@@ -177,6 +251,16 @@ def run_check(check: str, env: Mapping[str, str], workspace: Path, runner: Runne
     return result.returncode
 
 
+def run_prepare(check: str, env: Mapping[str, str], workspace: Path, runner: Runner = subprocess.run) -> int:
+    """Run one preparation step; input problems fail before anything downloads."""
+    try:
+        args = prepare_args(check, env, workspace)
+    except InputError as error:
+        print(command("error", str(error)))
+        return 2
+    return runner([sys.executable, str(CLI), *args], check=False).returncode
+
+
 @contextmanager
 def summary_stream(env: Mapping[str, str]) -> Iterator[TextIO]:
     """The job summary file, or stdout outside GitHub Actions."""
@@ -192,8 +276,183 @@ def _findings(report: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [item for baseline in report.get("baselines", []) for item in baseline.get("findings", [])]
 
 
+def _md(text: Any) -> str:
+    """Escape untrusted text for inline Markdown (cells and bullet text)."""
+    return str(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _resource(resource: Mapping[str, Any]) -> str:
+    kind = str(resource.get("kind") or "?")
+    name = str(resource.get("name") or "?")
+    namespace = str(resource.get("namespace") or "")
+    where = f"{kind} {name}"
+    return f"{where} ({namespace})" if namespace else where
+
+
+def _manifest_finding_line(finding: Mapping[str, Any]) -> str:
+    line = (f"- scenario `{_md(finding.get('scenario', ''))}`: `{finding.get('id', '?')}` "
+            f"({finding.get('severity', '?')}) at `{_md(finding.get('path', ''))}` on "
+            f"{_md(_resource(finding.get('resource') or {}))}")
+    related = finding.get("related_resource")
+    if related:
+        line += f" relating to {_md(_resource(related))}"
+    return f"{line} — {_md(finding.get('text', ''))}"
+
+
+def _manifest_compatibility(baseline: Mapping[str, Any]) -> str:
+    """A truthful compatibility label; null is never coerced to yes or no."""
+    if baseline.get("compatible") is True:
+        return "yes"
+    if baseline.get("compatible") is False:
+        return "no"
+    status = baseline.get("status")
+    if status == "new":
+        return "untested (new)"
+    if status == "error":
+        return "incomplete (error)"
+    if status == "compared":
+        return "incomplete (comparison unfinished)"
+    return "incomplete (not run)"
+
+
+def summarize_manifest(report: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+    """Markdown lines and workflow-command lines for a manifest report.
+
+    Candidate validation findings are counted once globally and their baseline
+    associations are shown separately; a completed baseline whose only failure
+    is an associated candidate finding displays as incompatible, never as a
+    pass. Unavailable provenance stays visible instead of being dropped.
+    """
+    mode = report.get("mode", "unknown mode")
+    status = report.get("status", "error")
+    manifest_set = str(report.get("manifest_set", "unknown manifest set"))
+    heading = f"Manifest compatibility: {_md(manifest_set)}"
+    prefix = f"Manifest compatibility: {manifest_set}"
+
+    candidate_findings = list(report.get("candidate_findings") or [])
+    baselines = list(report.get("baselines") or [])
+    baseline_findings = _findings(report)
+    active = [item for item in baseline_findings if not item.get("suppressed")]
+    suppressed = [item for item in baseline_findings if item.get("suppressed")]
+    errors = [str(error) for error in report.get("errors", [])]
+    errors += [str(error) for baseline in baselines for error in baseline.get("errors", [])]
+    breaking = [item for item in active + candidate_findings if item.get("severity") == "error"]
+    warnings = [item for item in active + candidate_findings if item.get("severity") == "warn"]
+    # Candidate findings are listed once in their own section (with their
+    # baseline associations); these sections list only baseline comparison
+    # findings so no logical finding appears twice.
+    baseline_breaking = [item for item in active if item.get("severity") == "error"]
+    baseline_warnings = [item for item in active if item.get("severity") == "warn"]
+    coverage = [item for item in baseline_warnings if item.get("classification") in ("coverage", "risk")]
+    other_warnings = [item for item in baseline_warnings
+                      if item.get("classification") not in ("coverage", "risk")]
+
+    lines = [
+        f"## {heading}",
+        "",
+        f"- **Mode:** {mode}",
+        f"- **Result:** {status}",
+        f"- **Candidate validation findings:** {len(candidate_findings)}",
+        f"- **Baseline comparison findings:** {len(active)} active, {len(suppressed)} suppressed",
+        f"- **Warnings:** {len(warnings)}",
+    ]
+    if report.get("policy_version"):
+        lines.append(f"- **Policy version:** `{report['policy_version']}`")
+
+    scenarios = (report.get("candidate") or {}).get("scenarios") or {}
+    if scenarios:
+        lines += ["", "### Candidate scenarios", "",
+                  "| Scenario | Status | Objects | Errors |", "| --- | --- | --- | --- |"]
+        for scenario_id in sorted(scenarios):
+            entry = scenarios[scenario_id] or {}
+            objects = entry.get("object_count")
+            lines.append(f"| `{_md(scenario_id)}` | {entry.get('status', 'unknown')} | "
+                         f"{'unknown' if objects is None else objects} | "
+                         f"{len(entry.get('errors') or [])} |")
+
+    if candidate_findings:
+        lines += ["", "### Candidate validation findings", "",
+                  "Validated on the candidate alone, so they apply to every baseline; each "
+                  "logical finding is listed once with its baseline associations.", ""]
+        for finding in candidate_findings:
+            lines.append(_manifest_finding_line(finding))
+            for association in finding.get("baseline_associations") or []:
+                lines.append(f"  - baseline `{_md(association.get('ref', ''))}` at "
+                             f"`{_md(association.get('path', ''))}`")
+
+    lines += ["", "### Baselines", "",
+              "| Ref | SHA | Status | Compatible | Active findings | Linked candidate findings |",
+              "| --- | --- | --- | --- | --- | --- |"]
+    for baseline in baselines:
+        findings = baseline.get("findings") or []
+        suppressed_count = len([item for item in findings if item.get("suppressed")])
+        findings_label = str(len(findings) - suppressed_count)
+        if suppressed_count:
+            findings_label += f" (+{suppressed_count} suppressed)"
+        sha = baseline.get("sha")
+        lines.append(f"| `{_md(baseline.get('ref', ''))}` | `{sha or 'unresolved'}` | "
+                     f"{baseline.get('status', 'unknown')} | {_manifest_compatibility(baseline)} | "
+                     f"{findings_label} | {len(baseline.get('associated_candidate_findings') or [])} |")
+
+    scenario_rows = [(baseline, scenario_id, (baseline.get("scenarios") or {}).get(scenario_id) or {})
+                     for baseline in baselines
+                     for scenario_id in sorted(baseline.get("scenarios") or {})]
+    if scenario_rows:
+        lines += ["", "### Baseline scenarios", "",
+                  "| Baseline | Scenario | Status | Objects | Detail |", "| --- | --- | --- | --- | --- |"]
+        for baseline, scenario_id, entry in scenario_rows:
+            detail = "; ".join(str(error) for error in entry.get("errors") or [])
+            detail = detail or str(entry.get("reason") or "")
+            objects = entry.get("object_count")
+            lines.append(f"| `{_md(baseline.get('ref', ''))}` | `{_md(scenario_id)}` | "
+                         f"{entry.get('status', 'unknown')} | "
+                         f"{'unknown' if objects is None else objects} | {_md(detail)} |")
+
+    if breaking:
+        lines += ["", "### Breaking findings", "",
+                  "Baseline comparison findings with error severity; candidate validation "
+                  "findings above also fail enforcement.", ""]
+        lines += [_manifest_finding_line(item) for item in baseline_breaking]
+
+    if suppressed:
+        lines += ["", "### Suppressed findings (waived exceptions)", ""]
+        for item in suppressed:
+            lines.append(f"- scenario `{_md(item.get('scenario', ''))}`: `{item.get('id', '?')}` at "
+                         f"`{_md(item.get('path', ''))}` — waived: "
+                         f"{_md(item.get('suppressed_reason') or 'no reason recorded')} "
+                         f"(severity stays {item.get('severity', '?')})")
+
+    if coverage:
+        lines += ["", "### Coverage limitations", ""]
+        lines += [_manifest_finding_line(item) for item in coverage]
+
+    if other_warnings:
+        lines += ["", "### Warnings", ""]
+        lines += [_manifest_finding_line(item) for item in other_warnings]
+
+    if errors:
+        lines += ["", "### Errors", ""]
+        lines += [f"- {_md(error)}" for error in errors]
+
+    commands = []
+    if status == "breaking":
+        message = (f"{prefix}: {status} ({mode}); {len(breaking)} breaking findings, "
+                   f"{len(warnings)} warnings. Download the manifest-contract-report artifact for details.")
+        commands.append(command("warning" if mode == "report-only" else "error", message))
+    elif status == "error":
+        joined = "; ".join(errors) or "unknown error"
+        commands.append(command("error", f"{prefix}: {status} ({mode}); {joined}"))
+    else:
+        commands.append(command("notice", f"{prefix}: {status} ({mode}); {len(candidate_findings)} "
+                                          f"candidate findings, {len(active)} baseline findings, "
+                                          f"{len(warnings)} warnings."))
+    return lines, commands
+
+
 def summarize(check: str, report: Mapping[str, Any]) -> tuple[list[str], list[str]]:
     """Markdown summary lines and workflow-command lines for a compatibility report."""
+    if check == "manifest":
+        return summarize_manifest(report)
     mode = report.get("mode", "unknown mode")
     status = report.get("status", "error")
     findings = _findings(report)
@@ -237,11 +496,17 @@ def summarize(check: str, report: Mapping[str, Any]) -> tuple[list[str], list[st
 
 
 def summarize_report(check: str, env: Mapping[str, str], report_path: Path = REPORT) -> int:
-    name = "CRD compatibility check" if check == "crd" else "Compatibility check"
+    names = {"crd": "CRD compatibility check", "manifest": "Manifest compatibility check"}
+    name = names.get(check, "Compatibility check")
     if not report_path.is_file():
         print(command("error", f"{name} did not produce {report_path.name}"))
         return 1
-    lines, commands = summarize(check, json.loads(report_path.read_text(encoding="utf-8")))
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        print(command("error", f"{name} produced an unreadable {report_path.name}: {error}"))
+        return 1
+    lines, commands = summarize(check, report)
     with summary_stream(env) as summary:
         summary.write("\n".join(lines) + "\n")
     print("\n".join(commands))
@@ -271,8 +536,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="step", required=True)
     subparsers.add_parser("require-pinned-ref")
-    subparsers.add_parser("run").add_argument("check", choices=("openapi", "crd", "coverage"))
-    subparsers.add_parser("summarize").add_argument("check", choices=("openapi", "crd"))
+    subparsers.add_parser("run").add_argument("check", choices=("openapi", "crd", "coverage", "manifest"))
+    subparsers.add_parser("prepare").add_argument("check", choices=("manifest",))
+    subparsers.add_parser("summarize").add_argument("check", choices=("openapi", "crd", "manifest"))
     subparsers.add_parser("annotate-coverage")
     args = parser.parse_args(argv)
 
@@ -284,6 +550,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code
     if args.step == "run":
         return run_check(args.check, env, Path.cwd())
+    if args.step == "prepare":
+        return run_prepare(args.check, env, Path.cwd())
     if args.step == "summarize":
         return summarize_report(args.check, env)
     return annotate_coverage(env)
