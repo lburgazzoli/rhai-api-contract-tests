@@ -15,7 +15,8 @@ compatibility check:
   primes their compilation. It renders no provider content.
 - ``render`` produces rendered bytes for one revision using fixed
   ``go run <module>@<version>`` commands outside any provider-controlled
-  go.mod/go.work influence, strictly offline (``GOPROXY=off``), in clean
+  go.mod/go.work influence, strictly offline (a ``file://`` module proxy
+  rooted at the prepared cache), in clean
   renderer homes, twice per revision to prove determinism.
 
 All diagnostics are sanitized: rendered manifests, values, and Secret contents
@@ -235,8 +236,10 @@ def _tool_env(cache_dir: Path | None, home: Path, *, offline: bool) -> dict[str,
     go.work/go.mod influence is disabled (``GOWORK=off``, ``GOENV=off``), the
     toolchain is pinned to the local install (``GOTOOLCHAIN=local``), and HOME,
     XDG directories, and the module/build caches point into isolated
-    locations. Render commands additionally disable all network access
-    (``GOPROXY=off``); preparation instead forces Go's checksum database.
+    locations. Render commands additionally run strictly offline
+    (``GOSUMDB=off`` and a ``file://`` module proxy rooted at the prepared
+    cache's download directory, which can only serve what preparation fetched
+    and verified); preparation instead forces Go's checksum database.
     """
     env = {
         key: value for key, value in os.environ.items()
@@ -259,7 +262,18 @@ def _tool_env(cache_dir: Path | None, home: Path, *, offline: bool) -> dict[str,
         env["GOCACHE"] = str(cache_dir / "gocache")
         env["GOPATH"] = str(cache_dir / "gopath")
     if offline:
-        env["GOPROXY"] = "off"
+        # A plain GOPROXY=off cannot run "go run <module>@<version>": go's
+        # resolution of the version-qualified argument queries the module
+        # proxy for the latest version (deprecation and retraction checks)
+        # and fails even when the exact module is already cached. Pointing
+        # the proxy at the cache's own download directory keeps rendering
+        # strictly offline — a file:// proxy serves only local files — while
+        # a missing or incomplete cache still fails closed.
+        if cache_dir is None:
+            env["GOPROXY"] = "off"
+        else:
+            download = cache_dir / "gomodcache" / "cache" / "download"
+            env["GOPROXY"] = Path(os.path.abspath(str(download))).as_uri()
         env["GOSUMDB"] = "off"
     else:
         # Force verification through Go's normal checksum mechanism; an
@@ -980,8 +994,10 @@ def prepare_tools(config: Mapping[str, Any], cache_dir: Path | None) -> dict[str
 
     The only network-enabled step: fetches and verifies the exact modules
     through Go's normal checksum mechanism, primes their compilation with the
-    pinned ``version`` commands, and records provenance. Renders no provider
-    content. Raw-only selections prepare nothing and need no cache.
+    pinned ``version`` commands, re-runs each one offline through the cache's
+    own file proxy to prove the cache is render-ready, and records
+    provenance. Renders no provider content. Raw-only selections prepare
+    nothing and need no cache.
     """
     scenarios = config.get("scenarios")
     if not isinstance(scenarios, list):
@@ -1062,6 +1078,32 @@ def prepare_tools(config: Mapping[str, Any], cache_dir: Path | None) -> dict[str
                 "observed_version": (observed[0][:200] if observed else ""),
                 "checksum_verification": "verified by the Go checksum database (GOSUMDB)",
             })
+        # Prove the prepared cache can render offline: rerun each pinned
+        # version command with the module proxy pointed at the cache itself.
+        # A file:// proxy serves only local files, so this fails loudly when
+        # anything the go-run resolution needs is missing from the cache.
+        for renderer in needed:
+            tool = PREPARED_TOOLS[renderer]
+            argv = ["go", "run", tool["pin"], "version"]
+            try:
+                result = _run(
+                    argv, env=_tool_env(cache, home, offline=True),
+                    timeout=PREPARE_TIMEOUT_SECONDS,
+                    stdout_limit=MAX_DIAGNOSTIC_BYTES,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RenderError(
+                    f"verifying offline use of {renderer} {tool['pin']} exceeded the "
+                    f"{PREPARE_TIMEOUT_SECONDS}-second timeout"
+                ) from error
+            except OSError as error:
+                raise RenderError(f"cannot run go: {error}") from error
+            if result.returncode != 0:
+                raise RenderError(
+                    f"prepared cache for {renderer} {tool['pin']} cannot run offline "
+                    f"(exit code {result.returncode}); rendering reuses only this cache: "
+                    f"{_sanitize_diagnostics(result.stderr, [])}"
+                )
     finally:
         _remove_renderer_home(home)
 

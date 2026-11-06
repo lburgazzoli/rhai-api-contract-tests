@@ -1,0 +1,9 @@
+apiVersion: v2
+name: app
+description: Self-test chart for the manifest compatibility checker
+type: application
+version: 0.1.0
+dependencies:
+  # Vendored local dependency: no repository field, so it must exist under charts/.
+  - name: helper
+    version: 0.1.0

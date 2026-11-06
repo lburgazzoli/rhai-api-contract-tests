@@ -1,0 +1,66 @@
+# Manifest self-test fixture: exercises all three renderers (raw YAML, Helm
+# with a vendored local dependency and selected values, Kustomize with a
+# generated ConfigMap reference) against the three audited Kubernetes minors.
+#
+# The baselineCases below are the explicit-new bootstrap declarations required
+# when these fixtures were introduced. Both refs were verified (2026-11-06) to
+# contain no selftest/manifests/ tree and no selftest/manifests.yaml:
+#   fab2dfff0566e367e6c0dcf58b475742dfe8649a  main head / pull-request base
+#   8eb288050bb4fb67324935e4bdf6c5c864af7008  task-009 commit, the intended
+#                                              previous-push ref when the
+#                                              fixture commit lands on main
+# A later event baseline that still lacks the fixtures but has no declaration
+# fails actionably; update this file only after verifying absence. Baselines
+# that contain the fixtures compare normally without any declaration.
+apiVersion: contracts.rhoai.io/v1alpha1
+kind: ManifestSet
+metadata:
+  name: selftest
+spec:
+  tools:
+    helmVersion: "4.3.1"
+    kustomizeVersion: "5.8.3"
+  scenarios:
+    - id: raw-app
+      renderer: raw
+      namespace: default
+      kubernetesVersion: 1.37.2
+      sources:
+        - selftest/manifests/raw/*.yaml
+      baselineCases:
+        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
+          state: new
+          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
+        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
+          state: new
+          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
+    - id: helm-app
+      renderer: helm
+      namespace: default
+      kubernetesVersion: 1.36.6
+      path: selftest/manifests/helm/app
+      releaseName: selftest
+      valuesFiles:
+        - selftest/manifests/helm/values-selftest.yaml
+      setValues:
+        replicaCount: "3"
+      releaseMode: upgrade
+      baselineCases:
+        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
+          state: new
+          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
+        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
+          state: new
+          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"
+    - id: kustomize-app
+      renderer: kustomize
+      namespace: selftest
+      kubernetesVersion: 1.35.10
+      path: selftest/manifests/kustomize/overlay
+      baselineCases:
+        - ref: fab2dfff0566e367e6c0dcf58b475742dfe8649a
+          state: new
+          reason: "PR base at fixture introduction: verified to contain no selftest/manifests sources"
+        - ref: 8eb288050bb4fb67324935e4bdf6c5c864af7008
+          state: new
+          reason: "previous push before the fixture commit: verified to contain no selftest/manifests sources"

@@ -1,0 +1,5 @@
+apiVersion: v2
+name: helper
+description: Vendored local dependency of the self-test chart
+type: application
+version: 0.1.0

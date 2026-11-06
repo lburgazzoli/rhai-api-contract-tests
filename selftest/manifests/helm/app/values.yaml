@@ -1,0 +1,9 @@
+image:
+  repository: example.com/web
+  tag: "1.0"
+replicaCount: 2
+shared:
+  alpha: one
+  beta: two
+helper:
+  helperValue: vendored

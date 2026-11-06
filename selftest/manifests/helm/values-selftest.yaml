@@ -1,0 +1,4 @@
+# Selected values for the self-test scenario; applied with --values by the
+# pinned helm renderer exactly as a provider's CI would select them.
+image:
+  tag: "1.1"

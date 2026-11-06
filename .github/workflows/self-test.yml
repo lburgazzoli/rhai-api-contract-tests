@@ -35,3 +35,20 @@ jobs:
       crd-globs: selftest/crd/*.yaml
       mode: enforce
       yq-version: "4.45.1"
+
+  # Each manifest scenario goes through the real reusable workflow with the
+  # real pinned go-run renderers. The baseline refs follow the same PR-base /
+  # previous-push convention as the other self-tests; the explicit-new
+  # bootstrap declarations for the fixture-introduction refs live in
+  # selftest/manifests.yaml and must be updated only after verified absence.
+  manifest:
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [raw-app, helm-app, kustomize-app]
+    uses: ./.github/workflows/provider-manifest-check.yml
+    with:
+      manifest-set: selftest/manifests.yaml
+      scenario-id: ${{ matrix.scenario }}
+      mode: enforce
+      baseline-refs: ${{ github.event.pull_request.base.sha || github.event.before }}

@@ -214,7 +214,9 @@ class FakeRunner:
 
     ``render_outputs`` is a list of ``(stdout, returncode, stderr)`` tuples or
     exceptions, cycled per render invocation; ``prepare_results`` maps a pin to
-    the result of its ``go run <pin> version`` priming command.
+    the result of its ``go run <pin> version`` priming command;
+    ``offline_prepare_results`` overrides the results of the offline
+    verification pass (chosen by ``GOSUMDB=off`` in the command environment).
     """
 
     def __init__(
@@ -224,11 +226,13 @@ class FakeRunner:
         go_error: Exception | None = None,
         render_outputs: list[tuple[bytes, int, bytes] | Exception] | None = None,
         prepare_results: dict[str, tuple[bytes, int, bytes] | Exception] | None = None,
+        offline_prepare_results: dict[str, tuple[bytes, int, bytes] | Exception] | None = None,
     ) -> None:
         self.go_output = go_output
         self.go_error = go_error
         self.render_outputs = render_outputs or [(b"", 0, b"")]
         self.prepare_results = prepare_results or {}
+        self.offline_prepare_results = offline_prepare_results
         self.calls: list[dict[str, Any]] = []
         self.render_calls: list[dict[str, Any]] = []
         self.prepare_calls: list[dict[str, Any]] = []
@@ -255,7 +259,11 @@ class FakeRunner:
             return completed(command, 0, self.go_output.encode(), b"")
         if len(command) >= 4 and command[1] == "run" and command[3] == "version":
             self.prepare_calls.append(call)
-            result = self.prepare_results.get(
+            results = self.prepare_results
+            if env is not None and env.get("GOSUMDB") == "off" and \
+                    self.offline_prepare_results is not None:
+                results = self.offline_prepare_results
+            result = results.get(
                 command[2], (b"version.BuildInfo{Version:\"pinned\"}", 0, b"")
             )
             if isinstance(result, Exception):
@@ -753,7 +761,19 @@ class TestPrepareTools:
         assert [call["argv"] for call in runner.prepare_calls] == [
             ["go", "run", HELM_PIN, "version"],
             ["go", "run", KUSTOMIZE_PIN, "version"],
+            ["go", "run", HELM_PIN, "version"],
+            ["go", "run", KUSTOMIZE_PIN, "version"],
         ]
+        # The first pass primes online through the checksum database; the
+        # second proves the cache renders offline via the cache-rooted
+        # file proxy with the checksum database disabled.
+        for call in runner.prepare_calls[:2]:
+            assert call["env"]["GOSUMDB"] == "sum.golang.org"
+        for call in runner.prepare_calls[2:]:
+            assert call["env"]["GOSUMDB"] == "off"
+            assert call["env"]["GOPROXY"] == (
+                cache / "gomodcache" / "cache" / "download"
+            ).as_uri()
 
     def test_old_toolchain_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         runner = FakeRunner(go_output="go version go1.25.4 linux/amd64")
@@ -789,6 +809,15 @@ class TestPrepareTools:
         runner = FakeRunner(prepare_results={HELM_PIN: (b"", 3, b"boom\n")})
         monkeypatch.setattr(renderers, "_run", runner)
         with pytest.raises(RenderError, match="cannot prepare.*boom"):
+            renderers.prepare_tools(config_with(["helm"]), tmp_path / "cache")
+
+    def test_offline_verification_failure_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cache that primes online but cannot render offline fails prepare."""
+        runner = FakeRunner(offline_prepare_results={HELM_PIN: (b"", 1, b"proxy off\n")})
+        monkeypatch.setattr(renderers, "_run", runner)
+        with pytest.raises(RenderError, match="cannot run offline.*proxy off"):
             renderers.prepare_tools(config_with(["helm"]), tmp_path / "cache")
 
     def test_prepare_timeout_reported(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -866,7 +895,11 @@ class TestHelmRender:
         envs = [call["env"] for call in runner.render_calls]
         assert len(envs) == 2
         for env in envs:
-            assert env["GOPROXY"] == "off"
+            # Strictly offline: the module proxy is the cache's own download
+            # directory, which no network request can reach.
+            assert env["GOPROXY"] == (
+                tmp_path / "tool-cache" / "gomodcache" / "cache" / "download"
+            ).as_uri()
             assert env["GOSUMDB"] == "off"
             assert env["GOWORK"] == "off"
             assert env["GOENV"] == "off"
@@ -1179,7 +1212,9 @@ class TestKustomizeRender:
         )
         for call in runner.render_calls:
             env = call["env"]
-            assert env["GOPROXY"] == "off"
+            assert env["GOPROXY"] == (
+                tmp_path / "tool-cache" / "gomodcache" / "cache" / "download"
+            ).as_uri()
             assert env["GOSUMDB"] == "off"
             assert env["GOTOOLCHAIN"] == "local"
             assert "KUSTOMIZE_PLUGIN" not in env

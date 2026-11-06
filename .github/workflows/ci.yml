@@ -49,7 +49,51 @@ jobs:
           YQ: ${{ github.workspace }}/bin/yq
         run: |
           python3 -m compileall cmd modules
-          python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests modules/manifest-compat/tests -v
+          # The manifest_renderers group needs a prepared Go tool cache and is
+          # selected by the dedicated manifest-renderers job below; pytest.ini
+          # registers the marker and excludes it by default.
+          python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests modules/manifest-compat/tests -m "not manifest_renderers" -v
+
+  # Real-renderer integration group: invokes the pinned go-run helm and
+  # kustomize modules exactly as production. Go 1.27 because the pinned
+  # Kustomize module requires it (the jobs above keep Go 1.26).
+  manifest-renderers:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: "1.27"
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+
+      # The only network-enabled step: fetch and verify the pinned renderer
+      # modules into a cache outside the checkout and prime their compilation.
+      - name: Prepare renderer tool cache
+        run: python3 cmd/contract-tests/cli.py manifest-prepare --repo . --manifest-set selftest/manifests.yaml --tool-cache-dir "${RUNNER_TEMP}/manifest-tool-cache"
+
+      # Rendering inside manifest-check is offline by construction (the checker
+      # disables the module proxy for every render subprocess), so this group
+      # reuses only the cache prepared above. A missing or unprepared cache
+      # fails the tests instead of skipping them.
+      - name: Run real-renderer integration tests
+        env:
+          MANIFEST_RENDERERS_CACHE: ${{ runner.temp }}/manifest-tool-cache
+        run: python3 -m pytest modules/manifest-compat/tests/test_renderer_integration.py -m manifest_renderers -v
+
 
   workflow-lint:
     runs-on: ubuntu-latest
