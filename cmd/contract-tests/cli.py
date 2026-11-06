@@ -2,9 +2,10 @@
 """contract-tests: local runner for shared RHOAI and ODH contract checks.
 
 This repository is the shared-tooling home. The runner currently wraps the
-OpenAPI and static CRD compatibility modules and a coverage check that
-confirms every API contract in a repository is registered; conversion and
-upgrade testing remain follow-on work.
+OpenAPI and static CRD compatibility modules, a coverage check that confirms
+every API contract in a repository is registered, and a Kubernetes manifest
+compatibility check that renders scenarios (raw YAML, Helm, Kustomize) and
+compares them against immutable Git baselines.
 
 The same invocation runs locally and in CI, so results are reproducible
 without a cluster:
@@ -27,6 +28,7 @@ from types import ModuleType
 _CHECKER_PATH = Path(__file__).resolve().parents[2] / "modules" / "openapi-compat" / "checker.py"
 _CRD_CHECKER_PATH = Path(__file__).resolve().parents[2] / "modules" / "crd-compat" / "checker.py"
 _COVERAGE_PATH = Path(__file__).resolve().parents[2] / "modules" / "coverage" / "checker.py"
+_MANIFEST_CHECKER_PATH = Path(__file__).resolve().parents[2] / "modules" / "manifest-compat" / "checker.py"
 
 
 def _load_module(name: str, path: Path) -> ModuleType:
@@ -48,6 +50,10 @@ def _load_crd_checker() -> ModuleType:
 
 def _load_coverage() -> ModuleType:
     return _load_module("coverage_checker", _COVERAGE_PATH)
+
+
+def _load_manifest_checker() -> ModuleType:
+    return _load_module("manifest_compat_checker", _MANIFEST_CHECKER_PATH)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -110,6 +116,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     discover.add_argument("--format", choices=("text", "json"), default="text")
     discover.add_argument("--yq", default=os.environ.get("YQ"), help="Pinned yq executable")
 
+    manifest_prepare = subparsers.add_parser(
+        "manifest-prepare",
+        help="Prepare the pinned Helm and Kustomize renderer modules in a tool cache (network-enabled)",
+    )
+    manifest_prepare.add_argument("--repo", type=Path, required=True, help="Path to the provider repository to check")
+    manifest_prepare.add_argument("--manifest-set", type=Path, required=True,
+                                  help="Path to the ManifestSet descriptor, relative to --repo "
+                                       "(e.g. .rhoai/manifests.yaml)")
+    manifest_prepare.add_argument("--scenario-id",
+                                  help="Prepare only the renderers this scenario needs; default considers every scenario")
+    manifest_prepare.add_argument("--tool-cache-dir", type=Path, required=True,
+                                  help="Cache directory for the pinned go-run renderer modules; populated "
+                                       "online with checksum verification and reused offline by manifest-check")
+
+    manifest_check = subparsers.add_parser(
+        "manifest-check",
+        help="Compare rendered Kubernetes manifests with immutable Git baselines",
+    )
+    manifest_check.add_argument("--repo", type=Path, required=True, help="Path to the provider repository to check")
+    manifest_check.add_argument("--manifest-set", type=Path, required=True,
+                                help="Path to the ManifestSet descriptor, relative to --repo "
+                                     "(e.g. .rhoai/manifests.yaml)")
+    manifest_check.add_argument("--scenario-id", help="Run a single scenario by id; default runs every scenario")
+    manifest_check.add_argument("--baseline-ref", action="append", required=True,
+                                help="Full resolved Git SHA; repeat for every supported baseline. Mutable refs are rejected.")
+    manifest_check.add_argument("--output-dir", type=Path, required=True,
+                                help="New report directory; existing paths are never overwritten")
+    manifest_check.add_argument("--tool-cache-dir", type=Path,
+                                help="Cache directory holding the prepared pinned renderer modules; required "
+                                     "when any selected scenario renders with Helm or Kustomize")
+    manifest_check.add_argument("--enforce", action="store_true",
+                                help="Exit 1 for breaking changes; default is report-only")
+
     args = parser.parse_args(argv)
     # The checker modules are loaded at runtime, so their return values are untyped here.
     code: int
@@ -121,6 +160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = _load_checker().run_check(args)
     elif args.command == "crd-check":
         code = _load_crd_checker().run_check(args)
+    elif args.command == "manifest-prepare":
+        code = _load_manifest_checker().run_prepare(args)
+    elif args.command == "manifest-check":
+        code = _load_manifest_checker().run_check(args)
     else:
         parser.error(f"Unknown command {args.command!r}")
     return code
