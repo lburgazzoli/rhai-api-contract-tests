@@ -1,0 +1,4 @@
+image:
+  tag: prod
+credentials:
+  password: manifest-test-secret-marker

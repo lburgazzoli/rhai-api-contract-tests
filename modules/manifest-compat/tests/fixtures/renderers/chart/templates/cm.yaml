@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-config
+  labels:
+    {{- include "demo.labels" . | nindent 4 }}
+data:
+  # the word lookup below is a field selector and a plain value, not a call
+  lookupName: {{ .Values.lookupName | default "none" | quote }}

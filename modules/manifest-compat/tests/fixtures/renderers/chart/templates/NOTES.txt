@@ -1,0 +1,1 @@
+Demo chart rendered for release {{ .Release.Name }}.

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: demo-tgz
+version: 0.1.0
+dependencies:
+  - name: archived
+    version: 1.0.0
