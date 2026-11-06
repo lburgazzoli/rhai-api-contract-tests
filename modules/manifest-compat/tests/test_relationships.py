@@ -388,7 +388,7 @@ class TestSelectorForm:
         ({"key": "env", "operator": "In", "values": ["prod"]}, {}, False),
         ({"key": "env", "operator": "NotIn", "values": ["prod"]}, {"env": "dev"}, True),
         ({"key": "env", "operator": "NotIn", "values": ["prod"]}, {"env": "prod"}, False),
-        ({"key": "env", "operator": "NotIn", "values": ["prod"]}, {}, False),
+        ({"key": "env", "operator": "NotIn", "values": ["prod"]}, {}, True),
         ({"key": "env", "operator": "Exists", "values": []}, {"env": "dev"}, True),
         ({"key": "env", "operator": "Exists", "values": []}, {}, False),
         ({"key": "env", "operator": "DoesNotExist", "values": []}, {}, True),

@@ -163,8 +163,10 @@ def _tool_cache_dir(env: Mapping[str, str], workspace: Path, *, required: bool) 
             raise InputError("tool-cache-dir is required for manifest preparation")
         return None
     base = Path(raw) if Path(raw).is_absolute() else workspace / raw
-    cache = Path(os.path.abspath(str(base)))
-    checkout = Path(os.path.abspath(str(workspace)))
+    # resolve(), not a lexical abspath: a path outside the workspace that is
+    # a symlink into it must not bypass the containment check.
+    cache = Path(os.path.abspath(str(base))).resolve()
+    checkout = Path(os.path.abspath(str(workspace))).resolve()
     if cache == checkout or checkout in cache.parents:
         raise InputError(
             "tool cache must live outside the provider checkout so it is never scanned as "

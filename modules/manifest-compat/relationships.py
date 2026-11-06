@@ -14,9 +14,10 @@ is not evidence of a failure.
 Selector semantics follow the audited Kubernetes sources for all three
 supported minors:
 
-* ``In``/``NotIn`` require the label key to exist (``NotIn`` additionally
-  requires the value to be outside the list); ``Exists`` requires the key,
-  ``DoesNotExist`` requires its absence (apimachinery ``Requirement.Matches``).
+* ``In`` requires the label key to exist with a value in the list;
+  ``NotIn`` is satisfied when the key is absent or its value is outside
+  the list; ``Exists`` requires the key, ``DoesNotExist`` requires its
+  absence (apimachinery ``Requirement.Matches``).
 * Service ``spec.selector`` absent or empty selects no pods automatically.
 * policy/v1 PodDisruptionBudget ``spec.selector``: a null selector matches
   no pods, an empty (``{}``) selector selects all pods in the namespace
@@ -303,7 +304,10 @@ def _form_matches(form: SelectorForm, labels: dict[str, Any]) -> bool:
             if not present or labels[key] not in values:
                 return False
         elif operator == "NotIn":
-            if not present or labels[key] in values:
+            # Upstream apimachinery Requirement.Matches: NotIn is satisfied
+            # when the key is absent (only a present key whose value is in
+            # the list fails the requirement).
+            if present and labels[key] in values:
                 return False
         elif operator == "Exists":
             if not present:

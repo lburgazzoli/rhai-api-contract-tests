@@ -346,6 +346,43 @@ class TestSanitizeDiagnostics:
     def test_empty_diagnostics(self) -> None:
         assert renderers._sanitize_diagnostics(b"   \n\n", []) == "(no diagnostics)"
 
+    def test_replaces_private_roots(self) -> None:
+        stderr = b"Error: '/tmp/tmpabc123/c1/manifests/base' must resolve to a file\n"
+        summary = renderers._sanitize_diagnostics(
+            stderr, [], private_roots=["/tmp/tmpabc123/c1"],
+        )
+        assert "/tmp/tmpabc123" not in summary
+        assert "<private>" in summary
+
+    def test_secret_straddling_truncation_boundary_is_redacted(self) -> None:
+        # Replacement runs on the full excerpt before per-line truncation, so
+        # a secret crossing the 200-character boundary cannot partially
+        # survive as a fragment.
+        padding = "x" * 190
+        stderr = f"{padding}{VALUES_SECRET_MARKER}\n".encode()
+        summary = renderers._sanitize_diagnostics(stderr, [VALUES_SECRET_MARKER])
+        assert VALUES_SECRET_MARKER not in summary
+        assert VALUES_SECRET_MARKER[:8] not in summary
+        assert "[redacted]" in summary
+
+    def test_private_root_straddling_truncation_boundary_is_replaced(self) -> None:
+        padding = "x" * 190
+        stderr = f"{padding}/tmp/tmpabc123/c1/base\n".encode()
+        summary = renderers._sanitize_diagnostics(
+            stderr, [], private_roots=["/tmp/tmpabc123/c1"],
+        )
+        assert "/tmp/tmpabc123" not in summary
+        assert "<private>" in summary
+
+    def test_private_roots_replaced_before_secret_redaction(self) -> None:
+        stderr = b"Error: cannot read /tmp/tmpabc123/c1/secret-values.yaml: marker\n"
+        summary = renderers._sanitize_diagnostics(
+            stderr, ["marker"], private_roots=["/tmp/tmpabc123/c1"],
+        )
+        assert "/tmp/tmpabc123" not in summary
+        assert "<private>" in summary
+        assert "marker" not in summary
+
 
 class TestTemplateScan:
     @pytest.mark.parametrize("template", [
@@ -475,6 +512,22 @@ class TestCandidateSnapshot:
         assert set(hazards_by_name(records)) == {"link.yaml"}
         assert not (destination / "link.yaml").exists()
 
+    def test_symlink_ancestor_directory_is_a_hazard(self, tmp_path: Path) -> None:
+        # lstat and O_NOFOLLOW protect only the final path component: a
+        # tracked directory replaced locally by a symlink must not let its
+        # indexed descendants be copied from outside the checkout.
+        repo = build_repo(tmp_path, files={"pkg/inner.txt": "original\n"})
+        outside = tmp_path / "outside"
+        (outside / "pkg").mkdir(parents=True)
+        (outside / "pkg" / "inner.txt").write_text("should never be copied\n")
+        shutil.rmtree(repo / "pkg")
+        os.symlink(outside / "pkg", repo / "pkg")
+        records, destination = snap_candidate(repo, tmp_path)
+        hazards = hazards_by_name(records)
+        assert hazards["pkg/inner.txt"]["hazard"] == "symlink-ancestor"
+        assert set(files_by_name(records)) == set()
+        assert not (destination / "pkg").exists()
+
     def test_gitlink_is_a_hazard(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={"a.yaml": "x: 1\n"})
         commit_extra_file(repo, "vendor/submodule", "", mode="160000", working_copy=False)
@@ -524,10 +577,11 @@ class TestCandidateSnapshot:
         destination = tmp_path / "snap"
         real = renderers._copy_candidate_entry
 
-        def failing(repo_arg: Path, name: str, mode: str | None, dest_arg: Path) -> Any:
+        def failing(repo_arg: Path, name: str, mode: str | None, dest_arg: Path,
+                    dir_cache: dict[str, bool]) -> Any:
             if name == "b.yaml":
                 raise RenderError("injected copy failure")
-            return real(repo_arg, name, mode, dest_arg)
+            return real(repo_arg, name, mode, dest_arg, dir_cache)
 
         monkeypatch.setattr(renderers, "_copy_candidate_entry", failing)
         with pytest.raises(RenderError, match="injected copy failure"):
@@ -888,6 +942,9 @@ class TestHelmRender:
         monkeypatch.setenv("HELM_DRIVER", "configmaps")
         monkeypatch.setenv("KUSTOMIZE_PLUGIN_HOME", "/tmp/x")
         monkeypatch.setenv("GOPROXY", "https://proxy.example.invalid")
+        monkeypatch.setenv("GOPRIVATE", "*")
+        monkeypatch.setenv("GONOPROXY", "example.invalid")
+        monkeypatch.setenv("GONOSUMDB", "example.invalid")
         repo = build_repo(tmp_path, copies={"chart": "charts/demo"})
         records, _ = snap_candidate(repo, tmp_path)
         cache = prepared_cache(tmp_path, "helm")
@@ -901,6 +958,11 @@ class TestHelmRender:
                 tmp_path / "tool-cache" / "gomodcache" / "cache" / "download"
             ).as_uri()
             assert env["GOSUMDB"] == "off"
+            # Inherited proxy-bypass settings would send matching modules to
+            # direct (network) VCS resolution; they are cleared.
+            assert env["GOPRIVATE"] == ""
+            assert env["GONOPROXY"] == ""
+            assert env["GONOSUMDB"] == ""
             assert env["GOWORK"] == "off"
             assert env["GOENV"] == "off"
             assert env["GOTOOLCHAIN"] == "local"
@@ -954,6 +1016,63 @@ class TestHelmRender:
             )
         message = str(excinfo.value)
         assert VALUES_SECRET_MARKER not in message
+        assert "[redacted]" in message
+
+    def test_subprocess_failure_redacts_chart_and_subchart_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Chart defaults are as likely to be echoed by a failing template as
+        # selected values are, so every values.yaml under the chart (including
+        # vendored subcharts) contributes redaction markers.
+        repo = build_repo(
+            tmp_path,
+            copies={"chart": "charts/demo"},
+            files={
+                "charts/demo/values.yaml": "secretValue: chart-defaults-secret-marker\n",
+                "charts/demo/charts/sub/values.yaml": "token: subchart-defaults-secret-marker\n",
+            },
+        )
+        records, _ = snap_candidate(repo, tmp_path)
+        stderr = (
+            b"Error: template failed near chart-defaults-secret-marker "
+            b"and subchart-defaults-secret-marker\n"
+        )
+        with pytest.raises(RenderError) as excinfo:
+            run_render(
+                monkeypatch, records, helm_scenario(), prepared_cache(tmp_path, "helm"),
+                render_outputs=[(b"", 1, stderr)],
+            )
+        message = str(excinfo.value)
+        assert "chart-defaults-secret-marker" not in message
+        assert "subchart-defaults-secret-marker" not in message
+        assert "[redacted]" in message
+
+    def test_subprocess_failure_redacts_archived_subchart_defaults(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Vendored chart archives are unpacked in memory by helm; their
+        # values.yaml members are chart defaults like any other.
+        archive = make_tgz({
+            "archived/Chart.yaml": b"apiVersion: v2\nname: archived\nversion: 1.0.0\n",
+            "archived/values.yaml": b"secretValue: archived-subchart-secret-marker\n",
+        })
+        repo = build_repo(tmp_path, files={
+            "charts/demo/Chart.yaml": (
+                "apiVersion: v2\nname: demo\nversion: 0.1.0\ndependencies:\n"
+                "  - name: archived\n    version: 1.0.0\n"
+            ),
+            "charts/demo/templates/cm.yaml": "kind: ConfigMap\n",
+            "charts/demo/charts/archived-1.0.0.tgz": archive,
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        stderr = b"Error: template failed near archived-subchart-secret-marker\n"
+        with pytest.raises(RenderError) as excinfo:
+            run_render(
+                monkeypatch, records, helm_scenario(), prepared_cache(tmp_path, "helm"),
+                render_outputs=[(b"", 1, stderr)],
+            )
+        message = str(excinfo.value)
+        assert "archived-subchart-secret-marker" not in message
         assert "[redacted]" in message
 
     def test_timeout_rejected(
@@ -1205,6 +1324,8 @@ class TestKustomizeRender:
     ) -> None:
         monkeypatch.setenv("KUSTOMIZE_PLUGIN", "x")
         monkeypatch.setenv("GOPROXY", "https://proxy.example.invalid")
+        monkeypatch.setenv("GOPRIVATE", "*")
+        monkeypatch.setenv("GONOPROXY", "example.invalid")
         repo = build_repo(tmp_path, copies={"kustomize": "manifests"})
         records, _ = snap_candidate(repo, tmp_path)
         _, runner = run_render(
@@ -1216,6 +1337,9 @@ class TestKustomizeRender:
                 tmp_path / "tool-cache" / "gomodcache" / "cache" / "download"
             ).as_uri()
             assert env["GOSUMDB"] == "off"
+            assert env["GOPRIVATE"] == ""
+            assert env["GONOPROXY"] == ""
+            assert env["GONOSUMDB"] == ""
             assert env["GOTOOLCHAIN"] == "local"
             assert "KUSTOMIZE_PLUGIN" not in env
             assert env["HOME"] != os.environ["HOME"]
@@ -1268,25 +1392,26 @@ class TestKustomizeRender:
         with pytest.raises(RenderError, match="exec plugins are not supported"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
 
-    def test_missing_resource_is_missing_input(self, tmp_path: Path) -> None:
+    def test_missing_resource_inside_kustomization_is_render_error(self, tmp_path: Path) -> None:
+        # The kustomization exists, so a missing nested reference is a broken
+        # (partially present) input set, not an absent one: it must stay a
+        # plain render error so a baseline cannot declare it new.
         repo = build_repo(tmp_path, files={
             "manifests/overlays/prod/kustomization.yaml":
                 "resources:\n  - nonexistent.yaml\n",
         })
         records, _ = snap_candidate(repo, tmp_path)
-        with pytest.raises(MissingInputError) as excinfo:
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
-        assert excinfo.value.missing == ["manifests/overlays/prod/nonexistent.yaml"]
 
-    def test_missing_component_is_missing_input(self, tmp_path: Path) -> None:
+    def test_missing_component_inside_kustomization_is_render_error(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={
             "manifests/overlays/prod/kustomization.yaml":
                 "components:\n  - ../../components/missing\n",
         })
         records, _ = snap_candidate(repo, tmp_path)
-        with pytest.raises(MissingInputError) as excinfo:
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
-        assert excinfo.value.missing == ["manifests/overlays/prod/../../components/missing"]
 
     def test_components_and_bases_recursed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         repo = build_repo(tmp_path, files={
@@ -1335,25 +1460,138 @@ class TestKustomizeRender:
         with pytest.raises(RenderError, match="cannot be safely materialized"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
 
-    def test_missing_env_file_is_missing_input(self, tmp_path: Path) -> None:
+    def test_missing_env_file_inside_kustomization_is_render_error(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={
             "manifests/overlays/prod/kustomization.yaml": (
                 "configMapGenerator:\n  - name: cfg\n    envs:\n      - nope.env\n"
             ),
         })
         records, _ = snap_candidate(repo, tmp_path)
-        with pytest.raises(MissingInputError) as excinfo:
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
-        assert excinfo.value.missing == ["manifests/overlays/prod/nope.env"]
 
-    def test_crds_glob_without_match_is_missing_input(self, tmp_path: Path) -> None:
+    def test_crds_glob_without_match_is_render_error(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={
             "manifests/overlays/prod/kustomization.yaml": "crds:\n  - '*.nomatch'\n",
         })
         records, _ = snap_candidate(repo, tmp_path)
-        with pytest.raises(MissingInputError) as excinfo:
+        with pytest.raises(RenderError, match="matches no files"):
             renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
-        assert excinfo.value.missing == ["manifests/overlays/prod/*.nomatch"]
+
+    def test_remote_strategic_merge_patch_rejected(self, tmp_path: Path) -> None:
+        # The pinned kustomize fetches URLs named in patchesStrategicMerge;
+        # offline rendering must have no network path at all, so remote
+        # entries are rejected before any subprocess runs.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "patchesStrategicMerge:\n  - https://example.invalid/patch.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="remote reference"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_missing_strategic_merge_patch_rejected(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "patchesStrategicMerge:\n  - absent-patch.yaml\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_inline_strategic_merge_patch_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The pinned kustomize parses each patchesStrategicMerge entry as
+        # inline patch content first and falls back to file paths, so YAML
+        # mapping entries are legitimate and must not be treated as
+        # references.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "resources: []\n"
+                "patchesStrategicMerge:\n"
+                "  - |-\n"
+                "      apiVersion: v1\n"
+                "      kind: ConfigMap\n"
+                "      metadata:\n"
+                "        name: cfg\n"
+                "  - file-patch.yaml\n"
+            ),
+            "manifests/overlays/prod/file-patch.yaml": "kind: ConfigMap\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        output, runner_fn = run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+        assert output == b""
+        assert len(runner_fn.render_calls) == 2
+
+    def test_strategic_merge_patch_hazard_rejected(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml":
+                "patchesStrategicMerge:\n  - patch.yaml\n",
+        })
+        os.symlink("/etc/passwd", repo / "manifests/overlays/prod/patch.yaml")
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="cannot be safely materialized"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_generator_files_key_path_alias_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # kustomize's file sources accept "key=path" aliases; the scanner
+        # must validate the path half, not the whole entry.
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "resources: []\nconfigMapGenerator:\n  - name: cfg\n    files:\n"
+                "      - settings=settings.ini\n"
+            ),
+            "manifests/overlays/prod/settings.ini": "[main]\nkey=value\n",
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        output, runner_fn = run_render(
+            monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+        )
+        assert output == b""
+        assert len(runner_fn.render_calls) == 2
+
+    def test_generator_files_alias_with_missing_path_rejected(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, files={
+            "manifests/overlays/prod/kustomization.yaml": (
+                "resources: []\nconfigMapGenerator:\n  - name: cfg\n    files:\n"
+                "      - settings=absent.ini\n"
+            ),
+        })
+        records, _ = snap_candidate(repo, tmp_path)
+        with pytest.raises(RenderError, match="does not exist in the snapshot"):
+            renderers.render(records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"))
+
+    def test_repository_root_path_rejected(self, tmp_path: Path) -> None:
+        repo = build_repo(tmp_path, copies={"kustomize": "manifests"})
+        records, _ = snap_candidate(repo, tmp_path)
+        for index, path_value in enumerate((".", "./", "./.")):
+            with pytest.raises(RenderError, match="repository root"):
+                renderers.render(
+                    records, kustomize_scenario(path=path_value),
+                    prepared_cache(tmp_path, "kustomize"),
+                )
+
+    def test_subprocess_failure_hides_snapshot_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Snapshot roots are random per run; error text quoting them would
+        # make failing reports non-deterministic and leak local paths.
+        repo = build_repo(tmp_path, copies={"kustomize": "manifests"})
+        records, destination = snap_candidate(repo, tmp_path)
+        stderr = f"Error: '{destination}/manifests/base' must resolve to a file\n".encode()
+        with pytest.raises(RenderError) as excinfo:
+            run_render(
+                monkeypatch, records, kustomize_scenario(), prepared_cache(tmp_path, "kustomize"),
+                render_outputs=[(b"", 1, stderr)],
+            )
+        message = str(excinfo.value)
+        assert str(destination) not in message
+        assert "<private>" in message
 
     def test_crds_glob_hazard_rejected(self, tmp_path: Path) -> None:
         repo = build_repo(tmp_path, files={

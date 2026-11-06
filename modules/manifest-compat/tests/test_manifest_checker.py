@@ -7,6 +7,7 @@ providers invoke them. Raw scenarios keep every test offline: no Go toolchain,
 tool cache, network, or cluster is required.
 """
 
+import argparse
 import copy
 import hashlib
 import importlib.util
@@ -114,6 +115,39 @@ stringData:
   password: manifest-check-secret-marker
 """
 
+KUSTOMIZE_TOOLS = {"helmVersion": "4.3.1", "kustomizeVersion": "5.8.3"}
+
+RENDERED_OBJECT = """apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shared
+data:
+  alpha: one
+"""
+
+
+def fake_renderer_run(real_run: Any, render_output: bytes) -> Any:
+    """Subprocess double for in-process kustomize checks: no Go, no network.
+
+    Git commands pass through to the real runner, ``go version`` reports a
+    compatible toolchain, and every ``go run`` render returns the fixed
+    ``render_output`` (identical on both determinism passes).
+    """
+    def fake(argv: Any, *, cwd: Any = None, env: Any = None, timeout: float,
+             stdout_limit: int, stderr_limit: int = 8192
+             ) -> subprocess.CompletedProcess[bytes]:
+        command = [str(argument) for argument in argv]
+        if command[0] == "git":
+            return real_run(command, cwd=cwd, env=env, timeout=timeout,
+                            stdout_limit=stdout_limit, stderr_limit=stderr_limit)
+        if command[:2] == ["go", "version"]:
+            return subprocess.CompletedProcess(
+                command, 0, b"go version go1.27.0 linux/amd64", b"")
+        if command[1] == "run":
+            return subprocess.CompletedProcess(command, 0, render_output, b"")
+        raise AssertionError(f"unexpected command {command}")
+    return fake
+
 
 def deployment(name: str, label: str) -> str:
     return f"""apiVersion: apps/v1
@@ -169,12 +203,16 @@ class Repo:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
-    def descriptor(self, scenarios: list[dict[str, Any]], name: str = "set") -> None:
+    def descriptor(self, scenarios: list[dict[str, Any]], name: str = "set",
+                   tools: dict[str, str] | None = None) -> None:
+        spec: dict[str, Any] = {"scenarios": scenarios}
+        if tools is not None:
+            spec["tools"] = tools
         document = {
             "apiVersion": "contracts.rhoai.io/v1alpha1",
             "kind": "ManifestSet",
             "metadata": {"name": name},
-            "spec": {"scenarios": scenarios},
+            "spec": spec,
         }
         self.write(".rhoai/manifests.yaml", yaml.safe_dump(document, sort_keys=False))
 
@@ -186,6 +224,18 @@ class Repo:
             "namespace": "default",
             "kubernetesVersion": "1.37.2",
             "sources": sources or ["manifests/*.yaml"],
+        }
+        scenario.update(extra)
+        return scenario
+
+    def kustomize_scenario(self, scenario_id: str = "app",
+                           path: str = "manifests/overlays/prod", **extra: Any) -> dict[str, Any]:
+        scenario: dict[str, Any] = {
+            "id": scenario_id,
+            "renderer": "kustomize",
+            "namespace": "default",
+            "kubernetesVersion": "1.37.2",
+            "path": path,
         }
         scenario.update(extra)
         return scenario
@@ -580,6 +630,55 @@ class TestNewDeclarations:
         assert entry["status"] == "error"
         assert "partially missing source set" in entry["errors"][0]
 
+    def test_partially_present_kustomize_declared_new_fails(
+            self, repo: Repo, outputs: Path, tmp_path: Path,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same fail-closed rule for kustomize: a kustomization that exists at
+        # the baseline but references a file that does not is a broken
+        # (partially present) input set, never an absent one, so an explicit
+        # new declaration must be refused. Kustomize scenarios normally need
+        # Go and a prepared cache; the faked renderer subprocess keeps this
+        # offline while exercising the real checker dispatch.
+        repo.write("manifests/overlays/prod/kustomization.yaml", "resources:\n  - added.yaml\n")
+        repo.descriptor(
+            [repo.kustomize_scenario(
+                baselineCases=[{"ref": "PENDING", "state": "new", "reason": "declared absent"}],
+            )],
+            tools=KUSTOMIZE_TOOLS,
+        )
+        baseline = repo.commit()
+        descriptor_text = (repo.root / ".rhoai/manifests.yaml").read_text(encoding="utf-8")
+        repo.write(".rhoai/manifests.yaml", descriptor_text.replace("PENDING", baseline))
+        # Candidate: the referenced file now exists, so the candidate renders.
+        repo.write("manifests/overlays/prod/added.yaml", CONFIGMAP)
+
+        modules = runner._modules()
+        renderers_module = modules["renderers"]
+        real_run = renderers_module._run
+        monkeypatch.setattr(
+            renderers_module, "_run", fake_renderer_run(real_run, RENDERED_OBJECT.encode()))
+        cache = tmp_path / "cache"
+        tool = renderers_module.PREPARED_TOOLS["kustomize"]
+        module_dir = cache / "gomodcache" / f"{tool['module']}@v{tool['version']}"
+        module_dir.mkdir(parents=True)
+        (module_dir / "go.mod").write_text("module pin\n")
+
+        output = outputs / "r1"
+        args = argparse.Namespace(
+            repo=repo.root, manifest_set=Path(".rhoai/manifests.yaml"),
+            baseline_ref=[baseline], output_dir=output, enforce=False,
+            tool_cache_dir=cache, scenario_id=None,
+        )
+        code = runner.run_check(args)
+        report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+        assert code == 2
+        assert report["candidate"]["scenarios"]["app"]["status"] == "ready"
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "error"
+        assert "does not exist in the snapshot" in entry["errors"][0]
+        assert report["baselines"][0]["status"] == "error"
+        assert report["status"] == "error"
+
     def test_historical_zero_object_render_fails(self, repo: Repo, outputs: Path) -> None:
         repo.write("manifests/cm.yaml", "# nothing here\n")
         repo.descriptor([repo.raw_scenario()])
@@ -678,6 +777,37 @@ class TestExceptions:
         assert finding["suppressed"] is True
         assert finding["suppressed_reason"] == "coordinated migration"
         assert finding["severity"] == "error"  # evidence keeps its severity
+        assert report["baselines"][0]["compatible"] is True
+
+    def test_empty_pointer_exception_waives_protected_removal(
+            self, repo: Repo, outputs: Path) -> None:
+        # protected-resource-removed emits the empty JSON pointer (the whole
+        # document); an exception with path "" must be able to waive it.
+        repo.write("manifests/cm.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(
+            protectedResources=[{
+                "group": "", "kind": "ConfigMap", "namespace": "default", "name": "shared",
+            }],
+            exceptions=[{
+                "ruleId": "protected-resource-removed",
+                "resource": {"group": "", "kind": "ConfigMap",
+                             "namespace": "default", "name": "shared"},
+                "path": "",
+                "baselineRef": "PENDING",
+                "reason": "deliberate decommission",
+            }],
+        )])
+        baseline = repo.commit()
+        descriptor_text = (repo.root / ".rhoai/manifests.yaml").read_text(encoding="utf-8")
+        repo.write(".rhoai/manifests.yaml", descriptor_text.replace("PENDING", baseline))
+        repo.write("manifests/cm.yaml", "# everything removed\n")
+        result, report = repo.check([baseline], outputs / "r1", enforce=True)
+        assert result.returncode == 0
+        assert report["status"] == "compatible"
+        finding = finding_for(report, "protected-resource-removed")
+        assert finding["suppressed"] is True
+        assert finding["suppressed_reason"] == "deliberate decommission"
+        assert finding["severity"] == "error"
         assert report["baselines"][0]["compatible"] is True
 
     def test_exception_for_other_path_does_not_waive(
@@ -981,6 +1111,35 @@ class TestPatchExtrapolation:
 # ---------------------------------------------------------------------------
 
 class TestReportSafety:
+    def test_scenario_inventory_normalizes_dotted_paths(self) -> None:
+        # Rendering normalizes "./" prefixes and trailing slashes (mirroring
+        # renderers._validate_repo_relative); inventories must select with
+        # the same form or a successfully rendered scenario would report no
+        # inputs.
+        records = [
+            {"file": "manifests/overlays/prod/kustomization.yaml", "sha256": "a"},
+            {"file": "manifests/cm.yaml", "sha256": "b"},
+            {"file": "other/file.yaml", "sha256": "c"},
+        ]
+        kustomize = {"renderer": "kustomize", "path": "./manifests/overlays/prod/"}
+        assert [e["file"] for e in runner._scenario_inventory(records, kustomize)] == [
+            "manifests/overlays/prod/kustomization.yaml"]
+        raw = {"renderer": "raw", "sources": ["./manifests/*.yaml"]}
+        assert [e["file"] for e in runner._scenario_inventory(records, raw)] == [
+            "manifests/cm.yaml", "manifests/overlays/prod/kustomization.yaml"]
+
+    def test_dotted_raw_sources_render_with_full_inventory(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/cm.yaml", CONFIGMAP)
+        repo.descriptor([repo.raw_scenario(sources=["./manifests/*.yaml"])])
+        baseline = repo.commit()
+        result, report = repo.check([baseline], outputs / "r1")
+        assert result.returncode == 0
+        assert report["status"] == "compatible"
+        entry = report["baselines"][0]["scenarios"]["app"]
+        assert entry["status"] == "compared"
+        assert [item["file"] for item in entry["inventory"]] == ["manifests/cm.yaml"]
+
     def test_secret_values_never_leak_into_report(
             self, repo: Repo, outputs: Path) -> None:
         repo.write("manifests/secret.yaml", SECRET)
@@ -1073,6 +1232,62 @@ class TestPrepareCommand:
         result, report = repo.check([baseline], outputs / "r1", enforce=True)
         assert result.returncode == 0
         assert report["status"] == "compatible"
+
+
+# ---------------------------------------------------------------------------
+# Tool-cache placement
+# ---------------------------------------------------------------------------
+
+class TestCacheLocation:
+    """A cache inside the checkout would be snapshotted as repository content."""
+
+    def prepare_into(self, repo: Repo, cache: Path) -> subprocess.CompletedProcess[str]:
+        argv = [sys.executable, str(CLI), "manifest-prepare",
+                "--repo", str(repo.root), "--manifest-set", ".rhoai/manifests.yaml",
+                "--tool-cache-dir", str(cache)]
+        return subprocess.run(argv, capture_output=True, text=True, timeout=120, env=ENV)
+
+    def check_into(self, repo: Repo, baseline: str, output: Path,
+                   cache: Path) -> subprocess.CompletedProcess[str]:
+        argv = [sys.executable, str(CLI), "manifest-check",
+                "--repo", str(repo.root), "--manifest-set", ".rhoai/manifests.yaml",
+                "--baseline-ref", baseline, "--output-dir", str(output),
+                "--tool-cache-dir", str(cache)]
+        return subprocess.run(argv, capture_output=True, text=True, timeout=120, env=ENV)
+
+    def test_prepare_rejects_cache_inside_checkout(self, repo: Repo) -> None:
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        repo.commit()
+        result = self.prepare_into(repo, repo.root / "tool-cache")
+        assert result.returncode == 2
+        assert "resolves inside the repository" in result.stderr
+        assert not (repo.root / "tool-cache").exists()
+
+    def test_check_rejects_cache_inside_checkout(
+            self, repo: Repo, outputs: Path) -> None:
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        result = self.check_into(repo, baseline, outputs / "r1", repo.root / "tool-cache")
+        assert result.returncode == 2
+        assert "resolves inside the repository" in result.stderr
+        # The failure still publishes an error report, never a silent pass.
+        report = json.loads((outputs / "r1" / "report.json").read_text(encoding="utf-8"))
+        assert report["status"] == "error"
+
+    def test_check_rejects_symlinked_cache_pointing_into_checkout(
+            self, repo: Repo, outputs: Path, tmp_path: Path) -> None:
+        # A path outside the checkout that is a symlink into it must not
+        # bypass the containment check.
+        repo.write("manifests/sc.yaml", STORAGE_CLASS)
+        repo.descriptor([repo.raw_scenario()])
+        baseline = repo.commit()
+        (repo.root / "tool-cache").mkdir()
+        os.symlink(repo.root / "tool-cache", tmp_path / "outside-cache")
+        result = self.check_into(repo, baseline, outputs / "r1", tmp_path / "outside-cache")
+        assert result.returncode == 2
+        assert "resolves inside the repository" in result.stderr
 
 
 # ---------------------------------------------------------------------------

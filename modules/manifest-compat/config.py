@@ -182,7 +182,9 @@ def _check_identity(value: Any, what: str) -> None:
 
 
 def _check_pointer(value: Any, what: str) -> None:
-    if not _nonempty_str(value) or POINTER_PATTERN.fullmatch(value) is None:
+    # The empty string is a valid RFC 6901 pointer (the whole document) and
+    # the schema permits it: removal findings emit "" and stay waiver-eligible.
+    if not isinstance(value, str) or POINTER_PATTERN.fullmatch(value) is None:
         raise ConfigError(f"{what} must be a valid RFC 6901 JSON Pointer")
 
 

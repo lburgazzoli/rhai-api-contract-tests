@@ -268,13 +268,19 @@ def _tool_env(cache_dir: Path | None, home: Path, *, offline: bool) -> dict[str,
         # and fails even when the exact module is already cached. Pointing
         # the proxy at the cache's own download directory keeps rendering
         # strictly offline — a file:// proxy serves only local files — while
-        # a missing or incomplete cache still fails closed.
+        # a missing or incomplete cache still fails closed. The proxy-bypass
+        # variables are cleared exactly as in the online branch: an ambient
+        # GOPRIVATE/GONOPROXY would otherwise send matching modules to
+        # direct VCS resolution, which is a network fetch.
         if cache_dir is None:
             env["GOPROXY"] = "off"
         else:
             download = cache_dir / "gomodcache" / "cache" / "download"
             env["GOPROXY"] = Path(os.path.abspath(str(download))).as_uri()
         env["GOSUMDB"] = "off"
+        env["GOPRIVATE"] = ""
+        env["GONOSUMDB"] = ""
+        env["GONOPROXY"] = ""
     else:
         # Force verification through Go's normal checksum mechanism; an
         # ambient GOPRIVATE must never silently disable it.
@@ -301,8 +307,39 @@ def _hazard_record(destination: Path, name: str, hazard: str) -> dict[str, Any]:
     return {"file": name, "root": str(destination), "hazard": hazard}
 
 
+def _ancestor_is_symlink(repo: Path, name: str, cache: dict[str, bool]) -> bool:
+    """Whether any directory between ``repo`` and ``name`` is a symlink.
+
+    ``lstat`` and ``O_NOFOLLOW`` on the file itself protect only the final
+    path component; a tracked directory replaced locally by a symlink would
+    otherwise let its indexed descendant files be copied from outside the
+    checkout. Results are cached per parent directory.
+    """
+    parent = PurePosixPath(name).parent.as_posix()
+    if parent in cache:
+        return cache[parent]
+    result = False
+    current = repo
+    for part in PurePosixPath(name).parts[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            raise RenderError(
+                f"cannot inspect repository directory {current!r}: {error}"
+            ) from error
+        if stat.S_ISLNK(info.st_mode):
+            result = True
+            break
+    cache[parent] = result
+    return result
+
+
 def _copy_candidate_entry(repo: Path, name: str, mode: str | None,
-                          destination: Path) -> dict[str, Any] | None:
+                          destination: Path,
+                          dir_cache: dict[str, bool]) -> dict[str, Any] | None:
     """Copy one working-tree entry, never following symlinks.
 
     Returns a hazard record (no materialized copy) for entries that cannot be
@@ -322,6 +359,8 @@ def _copy_candidate_entry(repo: Path, name: str, mode: str | None,
         return _hazard_record(destination, name, "symlink")
     if not stat.S_ISREG(info.st_mode):
         return _hazard_record(destination, name, "non-regular")
+    if _ancestor_is_symlink(repo, name, dir_cache):
+        return _hazard_record(destination, name, "symlink-ancestor")
     try:
         source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as error:
@@ -388,6 +427,7 @@ def snapshot_candidate(repo: Path, destination: Path) -> list[dict[str, Any]]:
         created = True
         os.chmod(destination, 0o700)
         records: list[dict[str, Any]] = []
+        dir_cache: dict[str, bool] = {}
         for entry in entries:
             if "\t" in entry:
                 meta, name = entry.split("\t", 1)
@@ -396,7 +436,7 @@ def snapshot_candidate(repo: Path, destination: Path) -> list[dict[str, Any]]:
                 name, mode = entry, None
             if _is_excluded(name):
                 continue
-            record = _copy_candidate_entry(repo, name, mode, destination)
+            record = _copy_candidate_entry(repo, name, mode, destination, dir_cache)
             if record is not None:
                 records.append(record)
         records.sort(key=lambda record: record["file"])
@@ -910,8 +950,15 @@ def _secret_markers_from_yaml(content: bytes, markers: set[str]) -> None:
                             markers.add(literal.split("=", 1)[1])
 
 
-def _helm_secret_markers(snapshot: _Snapshot, values_rels: Sequence[str],
+def _helm_secret_markers(snapshot: _Snapshot, chart_prefix: str,
+                         values_rels: Sequence[str],
                          set_values: Mapping[str, str]) -> list[str]:
+    """Redaction markers for helm diagnostics.
+
+    Covers the selected values files and set values (as before) plus every
+    values.yaml under the chart, including vendored subcharts: chart defaults
+    are as likely to be echoed by a failing template as selected values are.
+    """
     markers: set[str] = set()
     for rel in values_rels:
         _secret_markers_from_yaml(snapshot.read(rel), markers)
@@ -919,6 +966,30 @@ def _helm_secret_markers(snapshot: _Snapshot, values_rels: Sequence[str],
             _collect_string_leaves(yaml.safe_load(snapshot.read(rel)), markers)
         except yaml.YAMLError:
             pass
+    for file in sorted(snapshot.files):
+        if not file.startswith(chart_prefix):
+            continue
+        tail = file[len(chart_prefix):]
+        if tail in ("values.yaml", "values.yml") or tail.endswith("/values.yaml") \
+                or tail.endswith("/values.yml"):
+            _secret_markers_from_yaml(snapshot.read(file), markers)
+            try:
+                _collect_string_leaves(yaml.safe_load(snapshot.read(file)), markers)
+            except yaml.YAMLError:
+                pass
+        elif tail.endswith(".tgz"):
+            # Vendored chart archives are unpacked in memory by helm's
+            # dependency handling; their values.yaml members are chart
+            # defaults exactly like directory subcharts'.
+            members = _read_chart_archive(snapshot.read(file), file)
+            for name, content in sorted(members.items()):
+                if name in ("values.yaml", "values.yml") or name.endswith("/values.yaml") \
+                        or name.endswith("/values.yml"):
+                    _secret_markers_from_yaml(content, markers)
+                    try:
+                        _collect_string_leaves(yaml.safe_load(content), markers)
+                    except yaml.YAMLError:
+                        pass
     for value in set_values.values():
         if isinstance(value, str) and 4 <= len(value) <= 256:
             markers.add(value)
@@ -934,14 +1005,26 @@ def _kustomize_secret_markers(snapshot: _Snapshot, prefix: str) -> list[str]:
     return sorted(markers)[:MAX_REDACTION_STRINGS]
 
 
-def _sanitize_diagnostics(stderr: bytes, secrets: Sequence[str]) -> str:
-    """Reduce subprocess stderr to a short, redacted, safe excerpt."""
+def _sanitize_diagnostics(stderr: bytes, secrets: Sequence[str],
+                          private_roots: Sequence[str] = ()) -> str:
+    """Reduce subprocess stderr to a short, redacted, safe excerpt.
+
+    ``private_roots`` (snapshot and renderer-home locations) are replaced
+    with a stable placeholder: they are random per run, and error text
+    quoting them would make failing reports non-deterministic and would leak
+    local filesystem layout. Replacements run on the full excerpt before
+    line truncation so a value straddling a truncation boundary cannot
+    partially survive.
+    """
     text = stderr[:MAX_DIAGNOSTIC_BYTES].decode("utf-8", errors="replace")
-    lines = [line for line in text.splitlines() if line.strip()][:5]
-    summary = " | ".join(line[:200] for line in lines)
+    for root in private_roots:
+        if root:
+            text = text.replace(root, "<private>")
     for secret in secrets:
         if secret:
-            summary = summary.replace(secret, "[redacted]")
+            text = text.replace(secret, "[redacted]")
+    lines = [line for line in text.splitlines() if line.strip()][:5]
+    summary = " | ".join(line[:200] for line in lines)
     return _LONG_TOKEN_RE.sub("[redacted]", summary) or "(no diagnostics)"
 
 
@@ -1143,7 +1226,8 @@ def prepare_tools(config: Mapping[str, Any], cache_dir: Path | None) -> dict[str
 
 
 def _render_with_go(renderer: str, argv: list[str], scenario: Mapping[str, Any],
-                    cache_dir: Path, label: str, secrets: Sequence[str]) -> bytes:
+                    cache_dir: Path, label: str, secrets: Sequence[str],
+                    private_roots: Sequence[str] = ()) -> bytes:
     """Run the pinned go-run command twice offline and prove determinism."""
     scenario_id = scenario.get("id", "<unnamed>")
     home = _new_renderer_home()
@@ -1185,7 +1269,7 @@ def _render_with_go(renderer: str, argv: list[str], scenario: Mapping[str, Any],
             raise RenderError(
                 f"scenario {scenario_id!r}: {renderer} rendering of {label} failed "
                 f"(exit code {result.returncode}): "
-                f"{_sanitize_diagnostics(result.stderr, secrets)}"
+                f"{_sanitize_diagnostics(result.stderr, secrets, (*private_roots, str(home)))}"
             )
         outputs.append(result.stdout)
 
@@ -1212,7 +1296,18 @@ def _validate_repo_relative(value: Any, what: str, *, allow_glob: bool = False) 
         raise RenderError(f"{what} {value!r} must be a repo-relative path without '..' segments")
     if not allow_glob and _GLOB_CHARS.search(value):
         raise RenderError(f"{what} {value!r} must not contain glob characters")
-    return value
+    # Snapshot keys never carry "./" prefixes or trailing slashes, so inputs
+    # are normalized to the shape the snapshot uses; the repository root
+    # itself is rejected because no renderer input can be the whole checkout.
+    normalized = value
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.rstrip("/")
+    if normalized in ("", "."):
+        raise RenderError(
+            f"{what} {value!r} must name a path inside the repository, not the repository root"
+        )
+    return normalized
 
 
 def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
@@ -1223,7 +1318,12 @@ def _render_raw(snapshot: _Snapshot, scenario: Mapping[str, Any]) -> bytes:
     matched_files: list[str] = []
     missing: list[str] = []
     for pattern in sources:
-        _validate_repo_relative(pattern, f"scenario {scenario_id!r} sources entry", allow_glob=True)
+        # The normalized form (no "./" prefixes or trailing slashes) is what
+        # snapshot keys use, so both matching and missing-input reporting use
+        # it; the checker's scenario inventory normalizes identically.
+        pattern = _validate_repo_relative(
+            pattern, f"scenario {scenario_id!r} sources entry", allow_glob=True
+        )
         hazards = sorted(
             file for file in snapshot.hazards if fnmatch.fnmatchcase(file, pattern)
         )
@@ -1330,7 +1430,7 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
     if release_mode not in ("upgrade", "install"):
         raise RenderError(f"scenario {scenario_id!r}: releaseMode must be upgrade or install")
 
-    secrets = _helm_secret_markers(snapshot, values_rels, set_values)
+    secrets = _helm_secret_markers(snapshot, chart_prefix, values_rels, set_values)
     if snapshot.root is None:
         raise RenderError(f"scenario {scenario_id!r}: snapshot has no root")
     chart_dir = Path(snapshot.root) / chart_rel
@@ -1350,7 +1450,25 @@ def _render_helm(snapshot: _Snapshot, scenario: Mapping[str, Any], cache_dir: Pa
         argv.extend(["--set-string", f"{key}={set_values[key]}"])
     if release_mode == "upgrade":
         argv.append("--is-upgrade")
-    return _render_with_go("helm", argv, scenario, cache_dir, f"chart {chart_rel!r}", secrets)
+    return _render_with_go(
+        "helm", argv, scenario, cache_dir, f"chart {chart_rel!r}", secrets,
+        private_roots=() if snapshot.root is None else (str(snapshot.root),),
+    )
+
+
+def _is_inline_patch(entry: str) -> bool:
+    """Whether a patchesStrategicMerge entry is inline patch content.
+
+    The pinned kustomize parses each entry as YAML patch content first and
+    treats it as a file path only when that fails, so any entry that parses
+    to a mapping is inline content. Relative path strings parse as scalars
+    and therefore stay file references.
+    """
+    try:
+        parsed = yaml.safe_load(entry)
+    except yaml.YAMLError:
+        return False
+    return isinstance(parsed, dict)
 
 
 def _resolve_local_reference(entry: str, base_dir: str, snapshot: _Snapshot, field: str,
@@ -1388,10 +1506,12 @@ def _resolve_local_reference(entry: str, base_dir: str, snapshot: _Snapshot, fie
         if require_file:
             raise RenderError(f"{where}: {field} entry {entry!r} must be a file, not a directory")
         return rel
-    raise MissingInputError(
-        f"{where}: {field} entry {entry!r} does not exist in the snapshot",
-        missing=[f"{base_dir}/{entry}".lstrip("/")],
-        matched=[],
+    # The kustomization being validated exists in the snapshot, so this is a
+    # partially present input set, not an absent one: a plain render error
+    # keeps it comparable (and refuses a false explicit-new declaration)
+    # instead of surfacing as "inputs absent".
+    raise RenderError(
+        f"{where}: {field} entry {entry!r} does not exist in the snapshot"
     )
 
 
@@ -1412,10 +1532,11 @@ def _resolve_glob_files(entry: str, base_dir: str, snapshot: _Snapshot, field: s
             f"safely materialized ({snapshot.hazards[hazards[0]].get('hazard')})"
         )
     if not hits:
-        raise MissingInputError(
-            f"{where}: {field} entry {entry!r} matches no files in the snapshot",
-            missing=[f"{base_dir}/{entry}".lstrip("/")],
-            matched=[],
+        # Same partial-presence rule as _resolve_local_reference: the
+        # kustomization exists, so a glob that matches nothing is a broken
+        # historical input, not an absent source set.
+        raise RenderError(
+            f"{where}: {field} entry {entry!r} matches no files in the snapshot"
         )
 
 
@@ -1512,6 +1633,26 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
                     _resolve_local_reference(path, kust_dir, snapshot, "patches", where, require_file=True)
             else:
                 raise RenderError(f"{where}: patches entries must be strings or mappings")
+    # Deprecated but still supported by kustomize; the pinned kustomize
+    # fetches URLs named here, so file references must be validated like
+    # every other field (offline rendering must have no network path at
+    # all). Entries that parse as YAML mappings are inline patch content,
+    # which kustomize itself accepts ("for legacy reasons" its
+    # PatchStrategicMergeTransformer parses each entry as a patch first and
+    # falls back to treating it as a file path); inline content is never a
+    # reference and is never echoed by our errors.
+    patches_sm = document.get("patchesStrategicMerge")
+    if patches_sm is not None:
+        if not isinstance(patches_sm, list):
+            raise RenderError(f"{where}: patchesStrategicMerge must be a list")
+        for entry in patches_sm:
+            if not isinstance(entry, str):
+                raise RenderError(f"{where}: patchesStrategicMerge entries must be strings")
+            if _is_inline_patch(entry):
+                continue
+            _resolve_local_reference(
+                entry, kust_dir, snapshot, "patchesStrategicMerge", where, require_file=True
+            )
     for field, keys in (
         ("patchesJson6902", ("path",)),
         ("replacements", ("path",)),
@@ -1552,11 +1693,18 @@ def _validate_kustomization_tree(snapshot: _Snapshot, kust_dir: str,
                 ):
                     raise RenderError(f"{where}: {field} {key} entries must be strings")
                 for value in values:
-                    if _GLOB_CHARS.search(value):
-                        _resolve_glob_files(value, kust_dir, snapshot, key, where)
+                    # kustomize's file sources accept "key=path" aliases
+                    # (parseFileSource splits on the single "="); env sources
+                    # reject "=" themselves, so only files are split here.
+                    if key == "files" and "=" in value:
+                        path_value = value.split("=", 1)[1]
+                    else:
+                        path_value = value
+                    if _GLOB_CHARS.search(path_value):
+                        _resolve_glob_files(path_value, kust_dir, snapshot, key, where)
                     else:
                         _resolve_local_reference(
-                            value, kust_dir, snapshot, key, where, require_file=True
+                            path_value, kust_dir, snapshot, key, where, require_file=True
                         )
 
 
@@ -1590,7 +1738,8 @@ def _render_kustomize(snapshot: _Snapshot, scenario: Mapping[str, Any],
     argv = ["go", "run", KUSTOMIZE_PIN, "build", str(Path(snapshot.root) / kust_rel)]
     secrets = _kustomize_secret_markers(snapshot, kust_prefix)
     return _render_with_go(
-        "kustomize", argv, scenario, cache_dir, f"kustomization {kust_rel!r}", secrets
+        "kustomize", argv, scenario, cache_dir, f"kustomization {kust_rel!r}", secrets,
+        private_roots=(str(snapshot.root),),
     )
 
 

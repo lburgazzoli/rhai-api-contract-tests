@@ -197,6 +197,20 @@ def _sort_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=sort_key)
 
 
+def _normalized_repo_path(value: str) -> str:
+    """Normalize a scenario path/source the way renderers does.
+
+    Mirrors ``renderers._validate_repo_relative``: snapshot keys never carry
+    "./" prefixes or trailing slashes, and rendering normalizes inputs to
+    that shape — inventories must select with the same normalized form or
+    they would report no inputs for a successfully rendered scenario.
+    """
+    normalized = value
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.rstrip("/")
+
+
 def _scenario_inventory(records: Sequence[Mapping[str, Any]],
                         scenario: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Records selected as this scenario's renderer inputs (file + digest only)."""
@@ -206,10 +220,11 @@ def _scenario_inventory(records: Sequence[Mapping[str, Any]],
         file = str(record.get("file") or "")
         if renderer == "raw":
             patterns = scenario.get("sources") or []
-            if any(fnmatch.fnmatchcase(file, pattern) for pattern in patterns):
+            if any(fnmatch.fnmatchcase(file, _normalized_repo_path(pattern))
+                   for pattern in patterns):
                 selected.append({"file": file, "sha256": record.get("sha256")})
         else:
-            prefix = str(scenario.get("path") or "").strip("/") + "/"
+            prefix = _normalized_repo_path(str(scenario.get("path") or "")) + "/"
             if file.startswith(prefix):
                 selected.append({"file": file, "sha256": record.get("sha256")})
     selected.sort(key=lambda entry: entry["file"])
@@ -534,6 +549,26 @@ def _print_summary(report: dict[str, Any], output: Path) -> None:
 
 # --- Commands -------------------------------------------------------------------
 
+def _check_cache_location(args: argparse.Namespace) -> None:
+    """Reject a tool cache inside the provider checkout (resolved paths).
+
+    The candidate snapshot copies every nonignored working-tree file, so a
+    cache inside the checkout would be snapshotted as repository content.
+    ``resolve`` rather than a lexical ``abspath`` so a symlink outside the
+    checkout pointing into it cannot bypass the guard.
+    """
+    cache = getattr(args, "tool_cache_dir", None)
+    if cache is None:
+        return
+    repo = Path(args.repo).resolve()
+    resolved = Path(cache).resolve()
+    if resolved == repo or repo in resolved.parents:
+        raise CheckError(
+            f"tool cache {cache} resolves inside the repository checkout; keep it outside "
+            "(for example under the CI runner's temporary directory)"
+        )
+
+
 def run_prepare(args: argparse.Namespace) -> int:
     """Prepare the pinned renderer modules in the selected cache (network-enabled)."""
     try:
@@ -542,6 +577,7 @@ def run_prepare(args: argparse.Namespace) -> int:
         problems = verify_handler_coverage(catalogue, modules)
         if problems:
             raise CheckError("policy catalogue handler coverage is incomplete: " + "; ".join(problems))
+        _check_cache_location(args)
         config_data = modules["config"].load_config(args.repo, args.manifest_set, args.scenario_id)
         modules["config"].validate_context(config_data, args.repo, [], catalogue)
         provenance = modules["renderers"].prepare_tools(config_data, args.tool_cache_dir)
@@ -582,6 +618,7 @@ def run_check(args: argparse.Namespace) -> int:
     work_root: Path | None = None
     try:
         catalogue = load_catalogue()
+        _check_cache_location(args)
         report["policy_version"] = catalogue.get("policy_version")
         modules = _modules()
         problems = verify_handler_coverage(catalogue, modules)
