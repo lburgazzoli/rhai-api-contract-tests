@@ -51,8 +51,8 @@ pinned commits:
 
 The audit inspected validators **and** registry update strategies, defaulting,
 and declarative annotations. Searching only for `ValidateImmutableField` is
-insufficient: whole-spec restrictions (StatefulSet in 1.35/1.36, VolumeAttachment),
-ignored updates (CertificateSigningRequest), conditional rules (Service
+insufficient: whole-spec restrictions (StatefulSet in 1.35/1.36), ignored
+updates (CertificateSigningRequest), conditional rules (Service
 addressing), and baseline-gated rules (ConfigMap/Secret) live outside that
 helper. The machine-readable registry with per-rule source references is
 `modules/manifest-compat/policy.json`; it is the single source of truth for
@@ -91,15 +91,8 @@ Only three evidence classes may block:
 | Secret (`v1`) | `type` (default `Opaque`) | Unconditional, independent of the immutable flag |
 | RoleBinding / ClusterRoleBinding | `roleRef` | subjects mutable |
 | StorageClass | `provisioner`, `parameters`, `reclaimPolicy` (default `Delete`), `volumeBindingMode` (default `Immediate`) | Other storage settings not frozen |
-| CSIDriver | `spec.attachRequired` (default `true`), `spec.volumeLifecycleModes` (default `[Persistent]`) | `podInfoOnMount` mutable since 1.29 |
-| VolumeAttributesClass | `driverName`, `parameters` | |
-| VolumeAttachment | entire `spec` | kubelet/attacher-managed |
-| CSIStorageCapacity | `nodeTopology`, `storageClassName` | capacity is controller-managed |
-| CSINode | existing `spec.drivers` entries matched by name | allocatable gate-dependent (warning); add/remove not forbidden |
 | RuntimeClass | `handler` | |
 | PriorityClass | `value`, `preemptionPolicy` (default `PreemptLowerPriority`) | description/globalDefault mutable |
-| IngressClass | `spec.controller` | parameters not frozen |
-| EndpointSlice | `addressType` | endpoints/ports not intrinsically immutable |
 | ResourceQuota | `spec.scopes` (set comparison) | resource limits not frozen |
 | ResourceClaim / ResourceClaimTemplate (`resource.k8s.io/v1`) | entire `spec` | |
 | ResourceSlice | `spec.driver`, `spec.pool.name`, `spec.nodeName` | other fields not blanket-frozen |
@@ -110,8 +103,12 @@ Only three evidence classes may block:
 | PersistentVolume | `spec.persistentVolumeSource` union, `spec.volumeMode` (default `Filesystem`) | One-time `csi.controllerExpandSecretRef` initialization allowed; `persistentVolumeReclaimPolicy` is **mutable** |
 | PersistentVolumeClaim | `spec.accessModes`, `spec.selector`, `spec.dataSource`, `spec.dataSourceRef`, `spec.volumeMode` | One-time `volumeName` initialization; exact `storageClassName` beta-annotation and nil migrations allowed |
 | Service | Primary `clusterIPs[0]` once set; primary IP family; `loadBalancerClass` while both types are LoadBalancer; `healthCheckNodePort` while both need Local LB health checks | ExternalName and headless transitions exempt; validated secondary-family add/remove; `type`, `selector`, `nodePort` mutable |
-| IPAddress (`networking.k8s.io/v1`) | `spec.parentRef` | |
-| ServiceCIDR (`networking.k8s.io/v1`) | existing `spec.cidrs` values | validated single-to-dual-stack append allowed |
+
+Removed kind-specific checks: the kind-specific immutable/transition rules for
+CSIDriver, CSINode, CSIStorageCapacity, VolumeAttachment, VolumeAttributesClass,
+IngressClass, EndpointSlice, IPAddress, and ServiceCIDR were removed from the
+catalogue at user direction. These kinds remain valid rendered objects subject
+only to the generic checks (label drift, removal policy, protected contracts).
 
 #### Relationship and contract checks
 
@@ -143,7 +140,7 @@ Only three evidence classes may block:
 - **conditional-update-risk**: changes whose safety depends on live state or
   feature gates — PVC storage resize in either direction (failed-expansion
   recovery, `allowVolumeExpansion`), PV/PVC `volumeAttributesClassName`,
-  PV `nodeAffinity`, CSINode `allocatable`, suspended-Job template
+  PV `nodeAffinity`, suspended-Job template
   eligibility, one-sided Job selectors, unresolved default equivalence.
 - **rule-coverage-partial / patch-coverage-extrapolated / stale-exception**:
   coverage boundaries and configuration diagnostics.

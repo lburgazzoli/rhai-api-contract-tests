@@ -2,8 +2,8 @@
 
 Covers the "Other built-ins" matrix of the audited catalogue: for every rule a
 positive breaking fixture, a compatible counterexample, the default-equivalent
-case where the catalogue records defaults, target-version coverage, and the
-conditional CSINode allocatable warning. Fixtures go through the real
+case where the catalogue records defaults, and target-version coverage.
+Fixtures go through the real
 normalizer so defaults and Secret byte canonicalization behave exactly as in
 production, and every test asserts exact rule ID, pointer, resource identity,
 severity, and evidence rather than only finding counts.
@@ -319,174 +319,6 @@ class TestStorageClass:
         ) == []
 
 
-class TestCSIDriver:
-    def csi(self, **spec: Any) -> dict[str, Any]:
-        return doc("storage.k8s.io/v1", "CSIDriver", "csi", spec=spec)
-
-    def test_attach_required_default_equivalence_is_compatible(self) -> None:
-        assert run_compare([self.csi()], [self.csi(attachRequired=True)]) == []
-
-    def test_attach_required_change_errors(self) -> None:
-        finding = only(run_compare([self.csi(attachRequired=True)], [self.csi(attachRequired=False)]))
-        assert finding["id"] == "csidriver-attach-required-immutable"
-        assert finding["path"] == "/spec/attachRequired"
-        assert_resource(finding, "CSIDriver", "csi", namespace="", group="storage.k8s.io")
-
-    def test_volume_lifecycle_modes_default_equivalence_is_compatible(self) -> None:
-        assert run_compare(
-            [self.csi()], [self.csi(volumeLifecycleModes=["Persistent"])]
-        ) == []
-
-    def test_volume_lifecycle_modes_empty_list_defaults_like_omitted(self) -> None:
-        # SetDefaults_CSIDriver applies the default for len(modes)==0, so an
-        # explicitly empty list equals the defaulted ["Persistent"].
-        assert run_compare(
-            [self.csi(volumeLifecycleModes=[])], [self.csi(volumeLifecycleModes=["Persistent"])]
-        ) == []
-
-    def test_volume_lifecycle_modes_change_errors(self) -> None:
-        finding = only(run_compare(
-            [self.csi(volumeLifecycleModes=["Persistent"])],
-            [self.csi(volumeLifecycleModes=["Ephemeral"])],
-        ))
-        assert finding["id"] == "csidriver-volume-lifecycle-modes-immutable"
-        assert finding["path"] == "/spec/volumeLifecycleModes"
-
-    def test_pod_info_on_mount_is_mutable(self) -> None:
-        assert run_compare(
-            [self.csi(podInfoOnMount=False)], [self.csi(podInfoOnMount=True)]
-        ) == []
-
-
-class TestVolumeAttributesClass:
-    def vac(self, **extra: Any) -> dict[str, Any]:
-        base: dict[str, Any] = {"driverName": "csi.example.com", "parameters": {"a": "1"}}
-        base.update(extra)
-        return doc("storage.k8s.io/v1", "VolumeAttributesClass", "vac", **base)
-
-    def test_driver_name_change_errors(self) -> None:
-        finding = only(run_compare(
-            [self.vac()], [self.vac(driverName="other.example.com")]
-        ))
-        assert finding["id"] == "volumeattributesclass-driver-name-immutable"
-        assert finding["path"] == "/driverName"
-        assert_resource(finding, "VolumeAttributesClass", "vac", namespace="", group="storage.k8s.io")
-
-    def test_parameters_change_errors(self) -> None:
-        finding = only(run_compare([self.vac()], [self.vac(parameters={"a": "2"})]))
-        assert finding["id"] == "volumeattributesclass-parameters-immutable"
-        assert finding["path"] == "/parameters"
-
-    def test_beta_api_version_is_visible_not_compared(self) -> None:
-        finding = only(run_compare(
-            [doc("storage.k8s.io/v1beta1", "VolumeAttributesClass", "vac",
-                 driverName="csi.example.com", parameters={"a": "1"})],
-            [doc("storage.k8s.io/v1beta1", "VolumeAttributesClass", "vac",
-                 driverName="changed.example.com", parameters={"a": "2"})],
-        ))
-        assert finding["id"] == "rule-coverage-partial"
-        assert finding["severity"] == "warn"
-        assert finding["classification"] == "coverage"
-        assert finding["evidence"] == "unverified"
-        assert "v1beta1" in finding["text"]
-
-
-class TestVolumeAttachment:
-    def test_spec_change_errors(self) -> None:
-        finding = only(run_compare(
-            [doc("storage.k8s.io/v1", "VolumeAttachment", "va",
-                 spec={"attacher": "csi.example.com", "nodeName": "node-a", "source": {"persistentVolumeName": "pv"}})],
-            [doc("storage.k8s.io/v1", "VolumeAttachment", "va",
-                 spec={"attacher": "csi.example.com", "nodeName": "node-b", "source": {"persistentVolumeName": "pv"}})],
-        ))
-        assert finding["id"] == "volumeattachment-spec-immutable"
-        assert finding["path"] == "/spec"
-        assert_resource(finding, "VolumeAttachment", "va", namespace="", group="storage.k8s.io")
-
-    def test_metadata_change_is_compatible(self) -> None:
-        assert run_compare(
-            [doc("storage.k8s.io/v1", "VolumeAttachment", "va",
-                 spec={"attacher": "c", "nodeName": "n", "source": {}},
-                 metadata={"name": "va", "labels": {"a": "1"}})],
-            [doc("storage.k8s.io/v1", "VolumeAttachment", "va",
-                 spec={"attacher": "c", "nodeName": "n", "source": {}},
-                 metadata={"name": "va", "labels": {"a": "2"}})],
-        ) == []
-
-
-class TestCSIStorageCapacity:
-    def csc(self, **extra: Any) -> dict[str, Any]:
-        base = {"nodeTopology": {"matchLabels": {"topology": "zone-a"}},
-                "storageClassName": "fast", "capacity": "100Gi"}
-        base.update(extra)
-        return doc("storage.k8s.io/v1", "CSIStorageCapacity", "cap", **base)
-
-    def test_node_topology_change_errors(self) -> None:
-        finding = only(run_compare(
-            [self.csc()],
-            [self.csc(nodeTopology={"matchLabels": {"topology": "zone-b"}})],
-        ))
-        assert finding["id"] == "csistoragecapacity-node-topology-immutable"
-        assert finding["path"] == "/nodeTopology"
-        assert_resource(finding, "CSIStorageCapacity", "cap", group="storage.k8s.io")
-
-    def test_storage_class_name_change_errors(self) -> None:
-        finding = only(run_compare([self.csc()], [self.csc(storageClassName="slow")]))
-        assert finding["id"] == "csistoragecapacity-storage-class-name-immutable"
-        assert finding["path"] == "/storageClassName"
-
-    def test_capacity_is_not_frozen(self) -> None:
-        assert run_compare([self.csc()], [self.csc(capacity="200Gi")]) == []
-
-
-class TestCSINode:
-    def csinode(self, drivers: list[dict[str, Any]]) -> dict[str, Any]:
-        return doc("storage.k8s.io/v1", "CSINode", "node", spec={"drivers": drivers})
-
-    def test_matched_entry_change_errors(self) -> None:
-        finding = only(run_compare(
-            [self.csinode([{"name": "csi.example.com", "nodeID": "node-1",
-                            "allocatable": {"count": 4}}])],
-            [self.csinode([{"name": "csi.example.com", "nodeID": "node-2",
-                            "allocatable": {"count": 4}}])],
-        ))
-        assert finding["id"] == "csinode-driver-entries-immutable"
-        assert finding["path"] == "/spec/drivers"
-        assert finding["severity"] == "error"
-        assert_resource(finding, "CSINode", "node", namespace="", group="storage.k8s.io")
-
-    def test_matched_entry_allocatable_only_change_warns(self) -> None:
-        finding = only(run_compare(
-            [self.csinode([{"name": "csi.example.com", "nodeID": "node-1",
-                            "allocatable": {"count": 4}}])],
-            [self.csinode([{"name": "csi.example.com", "nodeID": "node-1",
-                            "allocatable": {"count": 8}}])],
-        ))
-        assert finding["id"] == "conditional-update-risk"
-        assert finding["severity"] == "warn"
-        assert finding["classification"] == "risk"
-        assert finding["evidence"] == "unverified"
-        assert "MutableCSINodeAllocatableCount" in finding["text"]
-
-    def test_entry_add_is_not_forbidden(self) -> None:
-        assert run_compare(
-            [self.csinode([{"name": "a.csi.example.com", "nodeID": "n"}])],
-            [self.csinode([
-                {"name": "a.csi.example.com", "nodeID": "n"},
-                {"name": "b.csi.example.com", "nodeID": "n"},
-            ])],
-        ) == []
-
-    def test_entry_removal_is_not_forbidden(self) -> None:
-        assert run_compare(
-            [self.csinode([
-                {"name": "a.csi.example.com", "nodeID": "n"},
-                {"name": "b.csi.example.com", "nodeID": "n"},
-            ])],
-            [self.csinode([{"name": "a.csi.example.com", "nodeID": "n"}])],
-        ) == []
-
-
 class TestRuntimeClass:
     def test_handler_change_errors(self) -> None:
         finding = only(run_compare(
@@ -532,46 +364,6 @@ class TestPriorityClass:
     def test_description_and_global_default_are_mutable(self) -> None:
         assert run_compare(
             [self.pc()], [self.pc(description="other", globalDefault=True)]
-        ) == []
-
-
-class TestIngressClass:
-    def test_controller_change_errors(self) -> None:
-        finding = only(run_compare(
-            [doc("networking.k8s.io/v1", "IngressClass", "ic",
-                 spec={"controller": "example.com/ingress-controller"})],
-            [doc("networking.k8s.io/v1", "IngressClass", "ic",
-                 spec={"controller": "other.com/ingress-controller"})],
-        ))
-        assert finding["id"] == "ingressclass-controller-immutable"
-        assert finding["path"] == "/spec/controller"
-        assert_resource(finding, "IngressClass", "ic", namespace="", group="networking.k8s.io")
-
-    def test_parameters_are_mutable(self) -> None:
-        assert run_compare(
-            [doc("networking.k8s.io/v1", "IngressClass", "ic",
-                 spec={"controller": "c", "parameters": {"apiGroup": "g", "kind": "K", "name": "n"}})],
-            [doc("networking.k8s.io/v1", "IngressClass", "ic",
-                 spec={"controller": "c", "parameters": {"apiGroup": "g", "kind": "K", "name": "m"}})],
-        ) == []
-
-
-class TestEndpointSlice:
-    def test_address_type_change_errors(self) -> None:
-        finding = only(run_compare(
-            [doc("discovery.k8s.io/v1", "EndpointSlice", "eps", addressType="IPv4", endpoints=[])],
-            [doc("discovery.k8s.io/v1", "EndpointSlice", "eps", addressType="IPv6", endpoints=[])],
-        ))
-        assert finding["id"] == "endpointslice-address-type-immutable"
-        assert finding["path"] == "/addressType"
-        assert_resource(finding, "EndpointSlice", "eps", group="discovery.k8s.io")
-
-    def test_endpoint_and_port_edits_are_not_immutable(self) -> None:
-        assert run_compare(
-            [doc("discovery.k8s.io/v1", "EndpointSlice", "eps", addressType="IPv4",
-                 endpoints=[{"addresses": ["10.0.0.1"]}], ports=[{"port": 80, "name": "http"}])],
-            [doc("discovery.k8s.io/v1", "EndpointSlice", "eps", addressType="IPv4",
-                 endpoints=[{"addresses": ["10.0.0.2"]}], ports=[{"port": 81, "name": "http"}])],
         ) == []
 
 
@@ -814,13 +606,13 @@ class TestApiVersionCoverage:
         # update is served through the candidate's stable API, so the audited
         # stable rules apply rather than a coverage gap.
         finding = only(run_compare(
-            [doc("storage.k8s.io/v1beta1", "VolumeAttributesClass", "vac",
-                 driverName="csi.example.com", parameters={"a": "1"})],
-            [doc("storage.k8s.io/v1", "VolumeAttributesClass", "vac",
-                 driverName="other.example.com", parameters={"a": "1"})],
+            [doc("resource.k8s.io/v1beta2", "ResourceClaim", "claim",
+                 spec={"devices": [{"name": "dev"}]})],
+            [doc("resource.k8s.io/v1", "ResourceClaim", "claim",
+                 spec={"devices": [{"name": "other"}]})],
         ))
-        assert finding["id"] == "volumeattributesclass-driver-name-immutable"
-        assert finding["path"] == "/driverName"
+        assert finding["id"] == "resourceclaim-spec-immutable"
+        assert finding["path"] == "/spec"
 
 
 class TestPurityAndContract:
@@ -829,16 +621,16 @@ class TestPurityAndContract:
         baseline_docs = [
             configmap(immutable=True, data={"a": "one"}),
             secret(immutable=True, data={"k": base64.b64encode(b"x").decode()}),
-            doc("storage.k8s.io/v1", "CSIDriver", "csi", spec={"attachRequired": True}),
-            doc("storage.k8s.io/v1", "CSINode", "node", spec={"drivers": [
-                {"name": "csi.example.com", "nodeID": "n", "allocatable": {"count": 4}}]}),
+            doc("storage.k8s.io/v1", "StorageClass", "fast",
+                provisioner="ebs.csi.aws.com"),
+            doc("scheduling.k8s.io/v1", "PriorityClass", "high", value=1000),
         ]
         candidate_docs = [
             configmap(immutable=True, data={"a": "two"}),
             secret(immutable=True, data={"k": base64.b64encode(b"y").decode()}),
-            doc("storage.k8s.io/v1", "CSIDriver", "csi", spec={"attachRequired": False}),
-            doc("storage.k8s.io/v1", "CSINode", "node", spec={"drivers": [
-                {"name": "csi.example.com", "nodeID": "n", "allocatable": {"count": 8}}]}),
+            doc("storage.k8s.io/v1", "StorageClass", "fast",
+                provisioner="other.csi.aws.com"),
+            doc("scheduling.k8s.io/v1", "PriorityClass", "high", value=2000),
         ]
         baseline = normalizer.normalize(render(baseline_docs), "baseline.yaml", scenario)
         candidate = normalizer.normalize(render(candidate_docs), "candidate.yaml", scenario)

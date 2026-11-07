@@ -2,27 +2,25 @@
 
 Implements the storage and networking transition rules registered in
 modules/manifest-compat/policy.json for objects present in both the baseline
-and candidate normalized maps: PersistentVolume, PersistentVolumeClaim,
-Service, IPAddress, and ServiceCIDR. The behavior mirrors the audited
-upstream validators (ValidatePersistentVolumeUpdate,
-ValidatePersistentVolumeClaimUpdate with the storage-class migration helpers,
-ValidateServiceUpdate with validateUpgradeDowngradeClusterIPs,
-validateUpgradeDowngradeIPFamilies, validateLoadBalancerClassField and
-validateServiceExternalTrafficFieldsUpdate, ValidateIPAddressUpdate, and
-ValidateServiceCIDRUpdate) at the three pinned Kubernetes commits.
+and candidate normalized maps: PersistentVolume, PersistentVolumeClaim, and
+Service. The behavior mirrors the audited upstream validators
+(ValidatePersistentVolumeUpdate, ValidatePersistentVolumeClaimUpdate with the
+storage-class migration helpers, ValidateServiceUpdate with
+validateUpgradeDowngradeClusterIPs, validateUpgradeDowngradeIPFamilies,
+validateLoadBalancerClassField and validateServiceExternalTrafficFieldsUpdate)
+at the three pinned Kubernetes commits.
 
 Three behavior classes are deliberately distinguished:
 
 * Provable violations (error): frozen PV volume-source union and volumeMode,
   PVC accessModes/selector/dataSource/dataSourceRef/volumeMode, explicit
-  primary Service addresses and families, conditional loadBalancerClass and
-  healthCheckNodePort edits, IPAddress parentRef, and ServiceCIDR changes
-  outside the validated single-to-dual-stack append.
+  primary Service addresses and families, and conditional loadBalancerClass
+  and healthCheckNodePort edits.
 * Source-verified transitions (compatible): the one-time PV
   controllerExpandSecretRef and PVC volumeName initializations, the exact PVC
   beta-annotation and nil storage-class migrations, setting PV nodeAffinity
-  when it was previously unset, secondary Service address/family add/remove
-  transitions, and the ServiceCIDR dual-stack append.
+  when it was previously unset, and secondary Service address/family add/remove
+  transitions.
 * Undecidable offline (warn): PV volumeAttributesClassName transitions,
   already-set PV nodeAffinity edits, PVC volumeAttributesClassName edits, and
   PVC storage size changes, whose safety depends on feature gates, live
@@ -617,102 +615,10 @@ def _compare_service(
     return findings
 
 
-def _parent_ref_of(spec: dict[str, Any]) -> dict[str, str] | None:
-    """IPAddress spec.parentRef with plain-string zero-value semantics.
-
-    ParentReference fields are plain strings in the upstream struct, so an
-    omitted key and an explicit empty string unmarshal identically; compare
-    the four source-verified struct fields with that equivalence.
-    """
-    ref = spec.get("parentRef")
-    if not isinstance(ref, dict):
-        return None
-    return {key: (ref.get(key) or "") for key in ("group", "kind", "name", "namespace")}
-
-
-def _compare_ip_address(
-    old_doc: dict[str, Any], new_doc: dict[str, Any], ctx: _ObjectContext
-) -> list[dict[str, Any]]:
-    if _parent_ref_of(_spec_of(old_doc)) != _parent_ref_of(_spec_of(new_doc)):
-        finding = ctx.finding(
-            "ipaddress-parent-ref-immutable",
-            "/spec/parentRef",
-            "IPAddress spec.parentRef is immutable after creation.",
-        )
-        return [finding] if finding is not None else []
-    return []
-
-
-def _cidr_family(value: Any) -> str | None:
-    if not isinstance(value, str):
-        return None
-    if ":" in value:
-        return "IPv6"
-    if "." in value:
-        return "IPv4"
-    return None
-
-
-def _compare_service_cidr(
-    old_doc: dict[str, Any], new_doc: dict[str, Any], ctx: _ObjectContext
-) -> list[dict[str, Any]]:
-    findings: list[dict[str, Any]] = []
-    old_cidrs = _string_list(_spec_of(old_doc).get("cidrs"))
-    new_cidrs = _string_list(_spec_of(new_doc).get("cidrs"))
-    if old_cidrs == new_cidrs:
-        return findings
-    if len(old_cidrs) == len(new_cidrs):
-        for index, (old_cidr, new_cidr) in enumerate(zip(old_cidrs, new_cidrs)):
-            if old_cidr != new_cidr:
-                finding = ctx.finding(
-                    "servicecidr-cidrs-transition",
-                    f"/spec/cidrs/{index}",
-                    "ServiceCIDR spec.cidrs entries may not change value; the only "
-                    "permitted transition appends one CIDR to convert single-stack to "
-                    "dual-stack.",
-                )
-                if finding is not None:
-                    findings.append(finding)
-        return findings
-    if len(old_cidrs) == 1 and len(new_cidrs) == 2:
-        if new_cidrs[0] != old_cidrs[0]:
-            finding = ctx.finding(
-                "servicecidr-cidrs-transition",
-                "/spec/cidrs/0",
-                "ServiceCIDR spec.cidrs entries may not change value; the dual-stack append "
-                "must keep the existing CIDR unchanged at index 0.",
-            )
-            if finding is not None:
-                findings.append(finding)
-        existing_family = _cidr_family(old_cidrs[0])
-        appended_family = _cidr_family(new_cidrs[1])
-        if existing_family is not None and existing_family == appended_family:
-            finding = ctx.finding(
-                "servicecidr-cidrs-transition",
-                "/spec/cidrs/1",
-                "ServiceCIDR dual-stack conversion appends one CIDR of the other IP family; "
-                "two CIDRs of the same family are rejected by the validated transition.",
-            )
-            if finding is not None:
-                findings.append(finding)
-        return findings
-    finding = ctx.finding(
-        "servicecidr-cidrs-transition",
-        "/spec/cidrs",
-        "ServiceCIDR spec.cidrs may not shrink or otherwise restructure; the only permitted "
-        "transition appends one CIDR to convert single-stack to dual-stack.",
-    )
-    if finding is not None:
-        findings.append(finding)
-    return findings
-
-
 _HANDLERS = {
     ("", "PersistentVolume"): _compare_persistent_volume,
     ("", "PersistentVolumeClaim"): _compare_persistent_volume_claim,
     ("", "Service"): _compare_service,
-    ("networking.k8s.io", "IPAddress"): _compare_ip_address,
-    ("networking.k8s.io", "ServiceCIDR"): _compare_service_cidr,
 }
 
 

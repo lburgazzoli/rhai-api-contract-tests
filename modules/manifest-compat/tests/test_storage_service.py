@@ -108,12 +108,6 @@ def one(
 PV_RESOURCE = {"group": "", "kind": "PersistentVolume", "namespace": "", "name": "data-pv"}
 PVC_RESOURCE = {"group": "", "kind": "PersistentVolumeClaim", "namespace": "rhoai", "name": "data-pvc"}
 SERVICE_RESOURCE = {"group": "", "kind": "Service", "namespace": "rhoai", "name": "api"}
-IPADDRESS_RESOURCE = {
-    "group": "networking.k8s.io", "kind": "IPAddress", "namespace": "", "name": "10.96.0.10",
-}
-SERVICECIDR_RESOURCE = {
-    "group": "networking.k8s.io", "kind": "ServiceCIDR", "namespace": "", "name": "cluster-cidr",
-}
 
 PV_BASELINE = """
 apiVersion: v1
@@ -215,27 +209,6 @@ spec:
   - name: https
     port: 443
     targetPort: 8443
-"""
-
-IPADDRESS_BASELINE = """
-apiVersion: networking.k8s.io/v1
-kind: IPAddress
-metadata:
-  name: 10.96.0.10
-spec:
-  parentRef:
-    name: api
-    kind: Service
-"""
-
-SERVICECIDR_BASELINE = """
-apiVersion: networking.k8s.io/v1
-kind: ServiceCIDR
-metadata:
-  name: cluster-cidr
-spec:
-  cidrs:
-  - 10.96.0.0/24
 """
 
 
@@ -750,61 +723,6 @@ class TestServiceConditionalFields:
         assert run_compare(SERVICE_BASELINE, candidate) == []
 
 
-class TestIPAddress:
-    def test_parent_ref_change_is_caught(self) -> None:
-        candidate = IPADDRESS_BASELINE.replace("    name: api", "    name: other")
-        finding = one(
-            run_compare(IPADDRESS_BASELINE, candidate),
-            "ipaddress-parent-ref-immutable",
-            "/spec/parentRef",
-            IPADDRESS_RESOURCE,
-        )
-        assert finding["severity"] == "error"
-
-    def test_parent_ref_unchanged_is_compatible(self) -> None:
-        candidate = IPADDRESS_BASELINE.replace("    kind: Service", "    kind: Service\n    group: \"\"")
-        assert run_compare(IPADDRESS_BASELINE, candidate) == []
-
-
-class TestServiceCIDR:
-    def test_existing_cidr_change_is_caught(self) -> None:
-        candidate = SERVICECIDR_BASELINE.replace("  - 10.96.0.0/24", "  - 10.96.0.0/23")
-        finding = one(
-            run_compare(SERVICECIDR_BASELINE, candidate),
-            "servicecidr-cidrs-transition",
-            "/spec/cidrs/0",
-            SERVICECIDR_RESOURCE,
-        )
-        assert finding["severity"] == "error"
-
-    def test_dual_stack_append_is_compatible(self) -> None:
-        candidate = SERVICECIDR_BASELINE.replace(
-            "  - 10.96.0.0/24", "  - 10.96.0.0/24\n  - 2001:db8::/64"
-        )
-        assert run_compare(SERVICECIDR_BASELINE, candidate) == []
-
-    def test_dual_stack_append_same_family_is_caught(self) -> None:
-        candidate = SERVICECIDR_BASELINE.replace(
-            "  - 10.96.0.0/24", "  - 10.96.0.0/24\n  - 10.97.0.0/24"
-        )
-        one(run_compare(SERVICECIDR_BASELINE, candidate),
-            "servicecidr-cidrs-transition", "/spec/cidrs/1")
-
-    def test_dual_stack_append_changing_existing_is_caught(self) -> None:
-        candidate = SERVICECIDR_BASELINE.replace(
-            "  - 10.96.0.0/24", "  - 10.96.0.0/23\n  - 2001:db8::/64"
-        )
-        one(run_compare(SERVICECIDR_BASELINE, candidate),
-            "servicecidr-cidrs-transition", "/spec/cidrs/0")
-
-    def test_cidr_removal_is_caught(self) -> None:
-        baseline = SERVICECIDR_BASELINE.replace(
-            "  - 10.96.0.0/24", "  - 10.96.0.0/24\n  - 2001:db8::/64"
-        )
-        one(run_compare(baseline, SERVICECIDR_BASELINE),
-            "servicecidr-cidrs-transition", "/spec/cidrs")
-
-
 COMPATIBLE_BASELINE = (
     PV_BASELINE
     + "---\n"
@@ -818,8 +736,6 @@ COMPATIBLE_BASELINE = (
     )
     + "---\n"
     + SERVICE_BASELINE
-    + "---\n"
-    + SERVICECIDR_BASELINE
 )
 
 COMPATIBLE_CANDIDATE = (
@@ -837,10 +753,6 @@ COMPATIBLE_CANDIDATE = (
     + SERVICE_BASELINE.replace(
         "  - 10.96.0.10", "  - 10.96.0.10\n  - fd00::10"
     ).replace("  - IPv4", "  - IPv4\n  - IPv6")
-    + "---\n"
-    + SERVICECIDR_BASELINE.replace(
-        "  - 10.96.0.0/24", "  - 10.96.0.0/24\n  - 2001:db8::/64"
-    )
 )
 
 BREAKING_CANDIDATE = (
@@ -851,10 +763,6 @@ BREAKING_CANDIDATE = (
     + PVC_BASELINE.replace("- ReadWriteOnce", "- ReadWriteMany")
     + "---\n"
     + SERVICE_BASELINE.replace("  - 10.96.0.10", "  - 10.96.0.11")
-    + "---\n"
-    + IPADDRESS_BASELINE.replace("    name: api", "    name: other")
-    + "---\n"
-    + SERVICECIDR_BASELINE.replace("  - 10.96.0.0/24", "  - 10.96.0.0/23")
 )
 
 BREAKING_BASELINE = (
@@ -863,10 +771,6 @@ BREAKING_BASELINE = (
     + PVC_BASELINE
     + "---\n"
     + SERVICE_BASELINE
-    + "---\n"
-    + IPADDRESS_BASELINE
-    + "---\n"
-    + SERVICECIDR_BASELINE
 )
 
 
@@ -885,25 +789,12 @@ class TestVersionCoverage:
             "pv-volume-source-immutable",
             "pvc-access-modes-immutable",
             "service-cluster-ips-transition",
-            "ipaddress-parent-ref-immutable",
-            "servicecidr-cidrs-transition",
         }
         assert all(finding["severity"] == "error" for finding in findings)
 
     def test_unsupported_minor_suppresses_rules(self) -> None:
         scenario = dict(SCENARIO, kubernetesVersion="1.34.1")
         findings = run_compare(BREAKING_BASELINE, BREAKING_CANDIDATE, scenario)
-        assert findings == []
-
-    def test_beta_api_version_does_not_reuse_stable_rule(self) -> None:
-        scenario = dict(SCENARIO, kubernetesVersion="1.36.6")
-        baseline = SERVICECIDR_BASELINE.replace(
-            "apiVersion: networking.k8s.io/v1", "apiVersion: networking.k8s.io/v1beta1"
-        )
-        candidate = SERVICECIDR_BASELINE.replace(
-            "apiVersion: networking.k8s.io/v1", "apiVersion: networking.k8s.io/v1beta1"
-        ).replace("  - 10.96.0.0/24", "  - 10.96.0.0/23")
-        findings = run_compare(baseline, candidate, scenario)
         assert findings == []
 
 
@@ -918,7 +809,7 @@ class TestModuleContract:
         assert candidate == candidate_copy
 
     def test_removed_objects_are_not_this_modules_concern(self) -> None:
-        candidate = SERVICE_BASELINE + "---\n" + SERVICECIDR_BASELINE
+        candidate = SERVICE_BASELINE
         findings = run_compare(BREAKING_BASELINE, candidate)
         assert "pv-volume-source-immutable" not in ids(findings)
         assert "pvc-access-modes-immutable" not in ids(findings)

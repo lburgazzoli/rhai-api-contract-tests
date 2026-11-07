@@ -390,15 +390,6 @@ class TestDefaultsAndQuantities:
         document = objects_of(result)[("scheduling.k8s.io", "PriorityClass", "", "pc")]["document"]
         assert document["preemptionPolicy"] == "PreemptLowerPriority"
 
-    def test_csidriver_defaults(self) -> None:
-        result = normalize(
-            "apiVersion: storage.k8s.io/v1\nkind: CSIDriver\nmetadata:\n  name: d\n"
-            "spec: {}\n"
-        )
-        document = objects_of(result)[("storage.k8s.io", "CSIDriver", "", "d")]["document"]
-        assert document["spec"]["attachRequired"] is True
-        assert document["spec"]["volumeLifecycleModes"] == ["Persistent"]
-
     def test_statefulset_defaults_including_claim_templates(self) -> None:
         result = normalize(
             "apiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: s\n"

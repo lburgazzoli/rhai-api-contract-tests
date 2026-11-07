@@ -2,9 +2,9 @@
 
 Implements the "Other built-ins" matrix of the audited field catalogue
 (modules/manifest-compat/policy.json): configuration (ConfigMap, Secret,
-ResourceQuota), RBAC bindings, storage-class and CSI metadata, node and
-scheduling classes, networking classes, endpoint discovery, stable dynamic
-resource allocation (DRA) APIs, certificates, and storage-version migration.
+ResourceQuota), RBAC bindings, storage classes, node and scheduling classes,
+stable dynamic resource allocation (DRA) APIs, certificates, and
+storage-version migration.
 
 The module is pure: it consumes normalized object maps (as produced by
 normalizer.normalize), the scenario, and the catalogue, and returns findings.
@@ -16,17 +16,12 @@ Semantics follow the audited upstream validators:
   slices compare in order but nil equals empty for maps and slices; field
   comparison here mirrors those semantics after applying the defaults recorded
   in the catalogue (list defaults apply to any empty list, matching upstream
-  len()==0 defaulting such as CSIDriver volumeLifecycleModes).
+  len()==0 defaulting).
 - ValidateConfigMapUpdate/ValidateSecretUpdate gate data immutability on the
   *baseline* immutable flag (never the candidate's) and compare data maps with
   reflect.DeepEqual, where an absent mapping and an empty mapping differ.
 - ResourceQuota spec.scopes compares as a set (sets.New in the validator);
   resource limits themselves are not frozen.
-- ValidateCSINodeUpdate freezes driver entries matched by name, but the
-  MutableCSINodeAllocatableCount feature gate excludes allocatable from the
-  comparison; gate-dependent allocatable-only changes downgrade to
-  conditional-update-risk warnings instead of errors, and entry add/remove is
-  not forbidden.
 - The CertificateSigningRequest registry strategy restores the previous spec
   (csrStrategy.PrepareForUpdate), so an authored spec change is an ignored,
   ineffective update rather than an API rejection; API-populated caller
@@ -52,7 +47,6 @@ ObjectKey = tuple[str, str, str, str]
 
 # Registry rule IDs; every emitted finding must exist in policy.json.
 _RULE_COVERAGE_PARTIAL = "rule-coverage-partial"
-_RULE_CONDITIONAL_RISK = "conditional-update-risk"
 
 # CertificateSigningRequest spec fields populated by the API server from the
 # requesting user (csrStrategy.PrepareForCreate); never user-authored YAML.
@@ -355,48 +349,6 @@ def _resourcequota(rules_by_id: dict[str, dict[str, Any]], scenario: dict[str, A
     return []
 
 
-def _driver_entries(document: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    spec = document.get("spec")
-    drivers = spec.get("drivers") if isinstance(spec, dict) else None
-    entries: dict[str, dict[str, Any]] = {}
-    for entry in drivers or []:
-        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-            entries.setdefault(entry["name"], entry)
-    return entries
-
-
-def _csinode(rules_by_id: dict[str, dict[str, Any]], scenario: dict[str, Any],
-             resource: dict[str, str], baseline: dict[str, Any],
-             candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    rule = _rule(rules_by_id, "csinode-driver-entries-immutable")
-    risk_rule = _rule(rules_by_id, _RULE_CONDITIONAL_RISK)
-    old_entries = _driver_entries(baseline)
-    new_entries = _driver_entries(candidate)
-    findings: list[dict[str, Any]] = []
-    for name in sorted(set(old_entries) & set(new_entries)):
-        old_entry, new_entry = old_entries[name], new_entries[name]
-        if _semantic_equal(old_entry, new_entry):
-            continue
-        old_rest = {key: value for key, value in old_entry.items() if key != "allocatable"}
-        new_rest = {key: value for key, value in new_entry.items() if key != "allocatable"}
-        if _semantic_equal(old_rest, new_rest):
-            # MutableCSINodeAllocatableCount gate decides; not provable offline.
-            findings.append(_finding(
-                risk_rule, scenario, resource, "/spec/drivers",
-                f"CSINode driver entry {name!r} changes only its allocatable count; "
-                "acceptance depends on the MutableCSINodeAllocatableCount feature gate, "
-                "which rendered manifests cannot prove, so this is reported as a "
-                "conditional risk rather than a violation",
-            ))
-        else:
-            findings.append(_finding(
-                rule, scenario, resource, "/spec/drivers",
-                f"CSINode driver entry {name!r} is immutable once present; the candidate "
-                "changes it (adding or removing entries is not forbidden)",
-            ))
-    return findings
-
-
 def _csr(rules_by_id: dict[str, dict[str, Any]], scenario: dict[str, Any],
          resource: dict[str, str], baseline: dict[str, Any],
          candidate: dict[str, Any]) -> list[dict[str, Any]]:
@@ -433,32 +385,12 @@ HANDLERS: dict[tuple[str, str], Handler] = {
         "reclaimPolicy": "storageclass-reclaim-policy-immutable",
         "volumeBindingMode": "storageclass-volume-binding-mode-immutable",
     }),
-    ("storage.k8s.io", "CSIDriver"): _fields_handler({
-        "spec.attachRequired": "csidriver-attach-required-immutable",
-        "spec.volumeLifecycleModes": "csidriver-volume-lifecycle-modes-immutable",
-    }),
-    ("storage.k8s.io", "VolumeAttributesClass"): _fields_handler({
-        "driverName": "volumeattributesclass-driver-name-immutable",
-        "parameters": "volumeattributesclass-parameters-immutable",
-    }),
-    ("storage.k8s.io", "VolumeAttachment"): _whole_spec_handler("volumeattachment-spec-immutable"),
-    ("storage.k8s.io", "CSIStorageCapacity"): _fields_handler({
-        "nodeTopology": "csistoragecapacity-node-topology-immutable",
-        "storageClassName": "csistoragecapacity-storage-class-name-immutable",
-    }),
-    ("storage.k8s.io", "CSINode"): _csinode,
     ("node.k8s.io", "RuntimeClass"): _fields_handler({
         "handler": "runtimeclass-handler-immutable",
     }),
     ("scheduling.k8s.io", "PriorityClass"): _fields_handler({
         "value": "priorityclass-value-immutable",
         "preemptionPolicy": "priorityclass-preemption-policy-immutable",
-    }),
-    ("networking.k8s.io", "IngressClass"): _fields_handler({
-        "spec.controller": "ingressclass-controller-immutable",
-    }),
-    ("discovery.k8s.io", "EndpointSlice"): _fields_handler({
-        "addressType": "endpointslice-address-type-immutable",
     }),
     ("resource.k8s.io", "ResourceClaim"): _whole_spec_handler("resourceclaim-spec-immutable"),
     ("resource.k8s.io", "ResourceClaimTemplate"): _whole_spec_handler(

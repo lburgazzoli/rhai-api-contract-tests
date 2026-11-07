@@ -391,12 +391,6 @@ def _apply_defaults(document: dict[str, Any], group: str, kind: str, where: str)
     elif (group, kind) == ("scheduling.k8s.io", "PriorityClass"):
         if document.get("preemptionPolicy") is None:
             document["preemptionPolicy"] = "PreemptLowerPriority"
-    elif (group, kind) == ("storage.k8s.io", "CSIDriver"):
-        if spec is not None:
-            if spec.get("attachRequired") is None:
-                spec["attachRequired"] = True
-            if spec.get("volumeLifecycleModes") is None:
-                spec["volumeLifecycleModes"] = ["Persistent"]
     elif (group, kind) == ("apps", "StatefulSet"):
         if spec is not None:
             if spec.get("podManagementPolicy") is None:
