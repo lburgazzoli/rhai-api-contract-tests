@@ -82,6 +82,9 @@ jobs:
       - name: Build the Swagger 2.0 converter
         run: go build -C .contract-tests/cmd/swagger2openapi -o "$PWD/bin/swagger2openapi" .
 
+      - name: Build the ECMAScript pattern validator
+        run: go build -C .contract-tests/cmd/openapi-validate -o "$PWD/bin/openapi-validate" .
+
       - name: Run compatibility check
         env:
           CONTRACT_SET: ${{ inputs.contract-set }}
@@ -91,6 +94,7 @@ jobs:
           OASDIFF: ${{ github.workspace }}/bin/oasdiff
           YQ: ${{ github.workspace }}/bin/yq
           SWAGGER2OPENAPI: ${{ github.workspace }}/bin/swagger2openapi
+          OPENAPI_VALIDATE: ${{ github.workspace }}/bin/openapi-validate
         run: python3 .contract-tests/cmd/workflow-steps/steps.py run openapi
 
       - name: Summarize compatibility result

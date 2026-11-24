@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -278,11 +278,11 @@ def prepare_for_comparison(document: Any, source: Path, stem: str, output: Path,
     return (dest if canonicalized else source), "openapi-3", None, canonicalized
 
 
-def findings(result: subprocess.CompletedProcess[str], operation: str) -> list[Document]:
+def findings(result: subprocess.CompletedProcess[str], operation: str, *, tool: str = "oasdiff") -> list[Document]:
     try:
         parsed = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise CheckError(f"oasdiff {operation} returned invalid JSON: {result.stderr or result.stdout}") from error
+        raise CheckError(f"{tool} {operation} returned invalid JSON: {result.stderr or result.stdout}") from error
     if parsed is None:
         parsed = []
     if not isinstance(parsed, list) or any(
@@ -290,19 +290,28 @@ def findings(result: subprocess.CompletedProcess[str], operation: str) -> list[D
         or not isinstance(item.get("text"), str) or not isinstance(item.get("level"), int)
         for item in parsed
     ):
-        raise CheckError(f"oasdiff {operation} returned malformed findings")
+        raise CheckError(f"{tool} {operation} returned malformed findings")
     if result.returncode not in (0, 1) or (result.returncode == 1 and not parsed):
-        raise CheckError(f"oasdiff {operation} failed: {result.stderr or result.stdout}")
+        raise CheckError(f"{tool} {operation} failed: {result.stderr or result.stdout}")
     return parsed
 
 
-def validate_spec(binary: Path, policy: Path, path: Path, cwd: Path) -> list[Document]:
+def validate_spec(binary: Path, policy: Path, path: Path, cwd: Path,
+                  get_validator: Callable[[], Path]) -> list[Document]:
     result = command(
         [binary, "validate", "--config", policy, "--allow-external-refs=false",
          "--fail-on", "ERR", "--format", "json", path], cwd=cwd, check=False,
     )
     records = findings(result, "validate")
-    if result.returncode:
+    if result.returncode == 1 and any(item["id"] == "schema-pattern-regex-invalid" for item in records):
+        # Go's regexp engine cannot compile valid ECMAScript constructs such as
+        # lookahead and backreferences. Revalidate the original document with
+        # the same kin-openapi library and an ECMAScript compiler. Never strip
+        # patterns from the documents used for validation or comparison.
+        result = command([get_validator(), path], cwd=cwd, check=False)
+        fallback = findings(result, "validate", tool="openapi-validate")
+        records = [item for item in records if item["id"] != "schema-pattern-regex-invalid"] + fallback
+    if result.returncode or any(item["level"] >= 3 for item in records):
         raise CheckError(f"Invalid OpenAPI contract {Path(path).name}: {json.dumps(records)}")
     return records
 
@@ -515,6 +524,21 @@ def check_compatibility(args: argparse.Namespace, output: Path, report: Document
     }
 
     converter: list[Path] = []
+    validator: list[Path] = []
+
+    def get_validator() -> Path:
+        if not validator:
+            try:
+                path = tool_path("openapi-validate", getattr(args, "openapi_validate", None), repo)
+            except CheckError as error:
+                raise CheckError(
+                    "This document needs ECMAScript pattern validation. Build the helper with "
+                    "`go build -C <api-contract-tests>/cmd/openapi-validate -o <provider>/bin/openapi-validate .` "
+                    "or pass --openapi-validate (see docs/onboarding/openapi-compat.md)"
+                ) from error
+            report["tool_build"]["openapi_validate"] = command([path, "--version"], cwd=output).stdout.strip()
+            validator.append(path)
+        return validator[0]
 
     def get_converter() -> Path:
         """Find the Swagger 2.0 converter once, and only when a Swagger 2.0 document needs it."""
@@ -570,7 +594,7 @@ def check_compatibility(args: argparse.Namespace, output: Path, report: Document
             raise CheckError(f"Baseline {ref!r} has no paths matching {match_path!r}; wrong API/version")
         compare_file, dialect, converted, canonicalized = prepare_for_comparison(
             baseline_document, baseline, f"baseline-{sha}", output, get_converter)
-        validation = validate_spec(oasdiff, policy_file, compare_file, output)
+        validation = validate_spec(oasdiff, policy_file, compare_file, output, get_validator)
         entry: Document = {
             "ref": ref, "sha": sha, "source": source, "status": "compared", "file": baseline.name,
             "sha256": digest(baseline), "dialect": dialect,
@@ -604,7 +628,7 @@ def check_compatibility(args: argparse.Namespace, output: Path, report: Document
     if canonicalized:
         report["candidate"]["canonicalized"] = canonicalized
     report["candidate"]["compare_file"] = candidate_compare.name
-    report["candidate"]["validation_findings"] = validate_spec(oasdiff, policy_file, candidate_compare, output)
+    report["candidate"]["validation_findings"] = validate_spec(oasdiff, policy_file, candidate_compare, output, get_validator)
 
     breaking = False
     compared = [baseline for baseline in report["baselines"] if baseline["status"] == "compared"]

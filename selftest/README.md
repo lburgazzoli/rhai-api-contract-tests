@@ -14,6 +14,9 @@ own pull request instead of first running when a provider bumps its pin.
 | `manifests.yaml` | Manifest check (ManifestSet descriptor) |
 | `manifests/raw/`, `manifests/helm/`, `manifests/kustomize/` | Manifest check scenarios: raw YAML, a Helm chart with a vendored dependency and selected values, and a Kustomize base/overlay with a generated ConfigMap reference |
 
+The widgets response includes an ECMAScript lookahead pattern, exercising the
+OpenAPI validator fallback in the reusable workflow.
+
 Each check compares against the pull request's base commit (or the previous
 `main` commit on push), so the self-test fails if a pull request makes a breaking
 change to these fixtures. Change them only in compatible ways, or update the

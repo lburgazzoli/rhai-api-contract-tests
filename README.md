@@ -113,6 +113,7 @@ For the consumer side, start with the
 ├── cmd/contract-tests/       # Local runner
 ├── cmd/release-baseline/     # Finds the commit an RHOAI release was based on (baseline SHA)
 ├── cmd/swagger2openapi/      # Converts Swagger 2.0 contracts to OpenAPI 3 for oasdiff (Go)
+├── cmd/openapi-validate/     # ECMAScript pattern validation fallback (Go)
 ├── modules/openapi-compat/   # OpenAPI compatibility engine
 ├── modules/crd-compat/       # Static CRD compatibility engine
 ├── modules/manifest-compat/  # Kubernetes manifest compatibility engine
@@ -138,7 +139,7 @@ For the consumer side, start with the
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-OASDIFF=/path/to/oasdiff YQ=/path/to/yq SWAGGER2OPENAPI=/path/to/swagger2openapi python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests cmd/release-baseline/tests modules/manifest-compat/tests -v
+OASDIFF=/path/to/oasdiff YQ=/path/to/yq SWAGGER2OPENAPI=/path/to/swagger2openapi OPENAPI_VALIDATE=/path/to/openapi-validate python3 -m pytest modules/openapi-compat/tests modules/crd-compat/tests modules/coverage/tests cmd/action-pins/tests cmd/workflow-steps/tests cmd/release-baseline/tests modules/manifest-compat/tests -v
 ```
 
 The manifest module's real-renderer integration tests are excluded from that
@@ -170,13 +171,16 @@ The provider workflows keep their logic in `cmd/workflow-steps/steps.py`
 provider workflow end to end on every pull request, against the fixture
 provider in [`selftest/`](selftest/README.md).
 
-The test suite requires `oasdiff` v1.33.0, `yq` v4.45.1 and the Swagger 2.0 converter:
+The test suite requires `oasdiff` v1.33.0, `yq` v4.45.1, the Swagger 2.0 converter,
+and the ECMAScript validation helper:
 
 ```bash
 GOBIN="$PWD/bin" go install github.com/oasdiff/oasdiff@v1.33.0
 GOBIN="$PWD/bin" go install github.com/mikefarah/yq/v4@v4.45.1
 go build -C cmd/swagger2openapi -o "$PWD/bin/swagger2openapi" .
 go test -C cmd/swagger2openapi ./...
+go build -C cmd/openapi-validate -o "$PWD/bin/openapi-validate" .
+go test -C cmd/openapi-validate ./...
 ```
 
 ## License

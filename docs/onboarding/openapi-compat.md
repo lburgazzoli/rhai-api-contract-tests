@@ -170,6 +170,18 @@ GOBIN="$PWD/bin" go install github.com/mikefarah/yq/v4@<version pinned in your d
 If a contract is a Swagger 2.0 document, also build the converter (see
 [Swagger 2.0 documents](#swagger-20-documents)).
 
+For schema patterns using ECMAScript features that Go cannot compile, such as
+lookahead or backreferences, also build the fallback validator:
+
+```bash
+go build -C <path-to-api-contract-tests>/cmd/openapi-validate -o "$PWD/bin/openapi-validate" .
+```
+
+The runner discovers it in the provider's `bin/`, or accepts `--openapi-validate`
+or `OPENAPI_VALIDATE`. The reusable workflow builds it automatically. The helper
+revalidates the original document; patterns remain part of the compatibility
+comparison. See [ECMAScript pattern validation](../../cmd/openapi-validate/README.md).
+
 `checker.py` rejects any other `oasdiff` or `yq` version. For `go install`
 builds that print `main`, it checks the binary's embedded Go module version.
 

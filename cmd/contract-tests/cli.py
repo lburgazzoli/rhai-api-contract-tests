@@ -88,6 +88,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     check.add_argument("--yq", default=os.environ.get("YQ"), help="Repository's pinned yq executable")
     check.add_argument("--swagger2openapi", default=os.environ.get("SWAGGER2OPENAPI"),
                        help="swagger2openapi converter (build cmd/swagger2openapi); needed only for Swagger 2.0 documents")
+    check.add_argument("--openapi-validate", default=os.environ.get("OPENAPI_VALIDATE"),
+                       help="ECMAScript pattern validator (build cmd/openapi-validate); needed when Go rejects a schema pattern")
 
     crd_check = subparsers.add_parser("crd-check", help="Compare CustomResourceDefinitions with immutable Git baselines")
     crd_check.add_argument("--repo", type=Path, required=True, help="Path to the provider repository to check")

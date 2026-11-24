@@ -25,6 +25,10 @@ components:
           type: string
         size:
           type: integer
+        source:
+          type: string
+          pattern: '^(?!private/)[a-z/]+$'
+          example: public/widgets
     WidgetList:
       type: object
       properties:

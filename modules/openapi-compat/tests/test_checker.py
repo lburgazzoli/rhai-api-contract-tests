@@ -9,6 +9,7 @@ sources and bundler lives in the model-registry repository
 Requires real pinned `oasdiff` (v1.33.0) and `yq` (v4.45.1) on PATH, or
 pointed to via the OASDIFF/YQ environment variables. Missing tools are
 failures, not skips, so a check that never ran cannot be mistaken for a pass.
+The ECMAScript tests also require the cmd/openapi-validate helper via OPENAPI_VALIDATE.
 
 Run with: python3 -m pytest modules/openapi-compat/tests/test_checker.py -v
 """
@@ -478,6 +479,52 @@ class TestOpenAPICompatChecker:
         result, report, _ = self.check(enforce=False)
         assert result.returncode == 2
         assert report["status"] == "error"
+
+    def accept_pattern_baseline(self, pattern):
+        self.mutate(f'.components.schemas.Item.properties.sourceId.pattern = {json.dumps(pattern)}')
+        self.regenerate()
+        self.git("add", "api")
+        self.commit("Accept an ECMAScript pattern")
+        self.baseline = self.git("rev-parse", "HEAD").stdout.strip()
+
+    @pytest.mark.parametrize("pattern", [
+        r"^(?!private/)[a-z/]+$",
+        r"^([a-z]+)-\1$",
+        r"^data$(?![\s\S])",
+    ])
+    def test_ecmascript_patterns_are_valid_in_baselines_and_candidates(self, pattern):
+        self.accept_pattern_baseline(pattern)
+        result, report, _ = self.check()
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert report["status"] == "compatible"
+        assert "openapi_validate" in report["tool_build"]
+
+    def test_ecmascript_patterns_do_not_hide_breaking_changes(self):
+        self.accept_pattern_baseline(r"^(?!private/)[a-z/]+$")
+        self.assert_breaking('.components.schemas.Item.properties.name.type = "integer"', "response-property-type-changed")
+
+    def test_ecmascript_patterns_still_participate_in_comparison(self):
+        self.mutate('.paths."/svc/v1/items".get.parameters += [{"name": "source", "in": "query", "schema": {"type": "string"}}]')
+        self.accept_pattern_baseline(r"^(?!private/)[a-z/]+$")
+        self.assert_breaking(
+            '.paths."/svc/v1/items".get.parameters[1].schema.pattern = "^(?!private/)[a-z/]+$"',
+            "request-parameter-pattern-added",
+        )
+
+    def test_malformed_pattern_still_fails_with_ecmascript_validation(self):
+        self.accept_pattern_baseline(r"^(?!private/)[a-z/]+$")
+        self.mutate('.components.schemas.Item.properties.sourceId.pattern = "["')
+        self.regenerate()
+        result, report, _ = self.check(enforce=False)
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert report["status"] == "error"
+        assert "schema-pattern-regex-invalid" in report["errors"][0]
+
+    def test_missing_ecmascript_validator_is_not_a_skipped_check(self):
+        self.accept_pattern_baseline(r"^(?!private/)[a-z/]+$")
+        result, report, _ = self.check(extra=["--openapi-validate", str(self.work / "missing-validator")])
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "needs ECMAScript pattern validation" in report["errors"][0]
 
     def test_change_outside_match_path_is_out_of_scope(self):
         self.mutate('del(.paths."/other/v1/widgets".get)', relative="api/openapi/src/ext/other.yaml")
