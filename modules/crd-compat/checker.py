@@ -2,7 +2,8 @@
 
 Compares a provider pull request's CustomResourceDefinitions against immutable
 Git baselines. The initial policy catches removals, newly required fields,
-type changes, enum narrowing, default changes, served-version removal, and
+type changes (including a Kubernetes int-or-string field narrowed to a single
+type), enum narrowing, default changes, served-version removal, and
 storage-version changes without requiring a Kubernetes cluster.
 """
 
@@ -200,6 +201,20 @@ def compare_schema(path: str, baseline: Any, candidate: Any, findings: list[Find
             findings.append(finding(
                 "type-changed", path,
                 f"changed type from {baseline_type!r} to {candidate_type!r}",
+            ))
+
+        # A Kubernetes int-or-string field has no top-level type, so the check
+        # above cannot see it lose one of its two alternatives. The marker is
+        # the signal; the union composition itself is not parsed.
+        if (
+            baseline.get("x-kubernetes-int-or-string") is True
+            and baseline_type is None
+            and candidate_type in ("integer", "string")
+            and candidate.get("x-kubernetes-int-or-string") is not True
+        ):
+            findings.append(finding(
+                "type-changed", path,
+                f"changed type from 'integer-or-string' to {candidate_type!r}",
             ))
 
         baseline_required = set(baseline.get("required") or [])

@@ -49,6 +49,82 @@ spec:
 """
 
 
+# A compact TrainJob CRD whose numProcPerNode field mirrors the
+# trainer.kubeflow.org schema change between the observed rhoai-3.5 and
+# rhoai-3.6 revisions: an x-kubernetes-int-or-string field narrowed to a
+# single type. The field body is spliced in at FIELD_MARKER.
+TRAINER_CRD = """
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: trainjobs.trainer.kubeflow.org
+spec:
+  group: trainer.kubeflow.org
+  names:
+    kind: TrainJob
+    plural: trainjobs
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                trainer:
+                  type: object
+                  properties:
+                    numProcPerNode:
+                      __FIELD__
+"""
+
+FIELD_MARKER = "__FIELD__"
+TRAINER_FIELD_PATH = (
+    "trainer.kubeflow.org/TrainJob/versions/v1alpha1.openAPIV3Schema"
+    ".properties.spec.properties.trainer.properties.numProcPerNode"
+)
+
+# The documented int-or-string encodings and the narrowed candidates.
+INT_OR_STRING_ANYOF = """x-kubernetes-int-or-string: true
+                      anyOf:
+                        - type: integer
+                        - type: string
+"""
+INT_OR_STRING_ANYOF_REORDERED = """x-kubernetes-int-or-string: true
+                      anyOf:
+                        - type: string
+                        - type: integer
+"""
+INT_OR_STRING_MARKER_ONLY = """x-kubernetes-int-or-string: true
+"""
+INT_OR_STRING_ALLOF = """x-kubernetes-int-or-string: true
+                      allOf:
+                        - anyOf:
+                            - type: integer
+                            - type: string
+"""
+INTEGER_ONLY = """type: integer
+                      format: int32
+"""
+INTEGER_ONLY_MARKER_FALSE = """type: integer
+                      format: int32
+                      x-kubernetes-int-or-string: false
+"""
+STRING_ONLY = """type: string
+"""
+UNMARKED_ANYOF = """anyOf:
+                        - type: integer
+                        - type: string
+"""
+
+
+def trainer_crd(field: str) -> str:
+    return TRAINER_CRD.replace(FIELD_MARKER, field)
+
+
 class TestCRDCompatChecker:
     @pytest.fixture(autouse=True)
     def setup(self, tmp_path):
@@ -83,6 +159,18 @@ class TestCRDCompatChecker:
 
     def commit(self, message):
         self.git("commit", "-m", message)
+
+    def commit_baseline(self, content, message):
+        """Stage a fixture, commit it, and return its full SHA for --baseline-ref.
+
+        The setup fixture's baseline is the Example CRD; tests that need a
+        different baseline CRD commit it themselves and pass the SHA along,
+        because commit() neither stages files nor refreshes self.baseline.
+        """
+        self.write(content)
+        self.git("add", "config")
+        self.commit(message)
+        return self.git("rev-parse", "HEAD").stdout.strip()
 
     def check(self, enforce=True, baseline=None, extra=()):
         output = self.work / f"report-{len(list(self.work.iterdir()))}"
@@ -123,6 +211,93 @@ class TestCRDCompatChecker:
         result, report = self.check()
         assert result.returncode == 1
         assert any(item["id"] == "type-changed" for item in report["baselines"][0]["findings"])
+
+    def test_int_or_string_narrowed_to_integer_is_breaking(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INTEGER_ONLY))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 1
+        assert report["status"] == "breaking"
+        findings = report["baselines"][0]["findings"]
+        assert len(findings) == 1
+        assert findings[0] == {
+            "id": "type-changed",
+            "path": TRAINER_FIELD_PATH,
+            "text": "changed type from 'integer-or-string' to 'integer'",
+            "severity": "error",
+        }
+
+    def test_int_or_string_narrowed_to_string_is_breaking(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(STRING_ONLY))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 1
+        findings = report["baselines"][0]["findings"]
+        assert len(findings) == 1
+        assert findings[0]["id"] == "type-changed"
+        assert findings[0]["text"] == "changed type from 'integer-or-string' to 'string'"
+
+    def test_marker_only_int_or_string_narrowed_is_breaking(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_MARKER_ONLY), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INTEGER_ONLY))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 1
+        assert any(item["id"] == "type-changed" and item["path"] == TRAINER_FIELD_PATH
+                   for item in report["baselines"][0]["findings"])
+
+    def test_all_of_wrapped_int_or_string_narrowed_is_breaking(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ALLOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INTEGER_ONLY))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 1
+        assert any(item["id"] == "type-changed" and item["path"] == TRAINER_FIELD_PATH
+                   for item in report["baselines"][0]["findings"])
+
+    def test_int_or_string_narrowed_with_marker_false_is_breaking(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INTEGER_ONLY_MARKER_FALSE))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 1
+        assert any(item["id"] == "type-changed" and item["path"] == TRAINER_FIELD_PATH
+                   for item in report["baselines"][0]["findings"])
+
+    def test_int_or_string_narrowing_report_only_records_findings(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INTEGER_ONLY))
+        result, report = self.check(enforce=False, baseline=baseline)
+        assert result.returncode == 0
+        assert report["status"] == "breaking"
+        findings = report["baselines"][0]["findings"]
+        assert len(findings) == 1
+        assert findings[0]["id"] == "type-changed"
+        assert findings[0]["path"] == TRAINER_FIELD_PATH
+
+    def test_unchanged_int_or_string_is_compatible(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert report["status"] == "compatible"
+
+    def test_reordered_int_or_string_union_is_compatible(self):
+        baseline = self.commit_baseline(trainer_crd(INT_OR_STRING_ANYOF), "numProcPerNode accepts integer or string")
+        self.write(trainer_crd(INT_OR_STRING_ANYOF_REORDERED))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert report["status"] == "compatible"
+
+    def test_widening_integer_to_int_or_string_is_compatible(self):
+        baseline = self.commit_baseline(trainer_crd(INTEGER_ONLY), "numProcPerNode is an integer")
+        self.write(trainer_crd(INT_OR_STRING_ANYOF))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert report["status"] == "compatible"
+
+    def test_unmarked_union_composition_is_not_analyzed(self):
+        baseline = self.commit_baseline(trainer_crd(UNMARKED_ANYOF), "numProcPerNode has an unmarked union")
+        self.write(trainer_crd(INTEGER_ONLY))
+        result, report = self.check(baseline=baseline)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert report["status"] == "compatible"
 
     def test_enum_narrowing_is_breaking(self):
         self.write(BASE_CRD.replace("enum: [fast, slow]", "enum: [fast]"))

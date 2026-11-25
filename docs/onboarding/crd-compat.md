@@ -12,6 +12,15 @@ request against immutable Git baselines. It initially detects:
 - newly required properties;
 - type changes, enum narrowing, and default changes.
 
+A field marked `x-kubernetes-int-or-string` that is narrowed to a single
+`type: integer` or `type: string` is reported as a type change: such a field
+has no top-level type, so losing one of its two alternatives is otherwise
+invisible to the check. The detection is keyed on the marker, not on the
+union's composition. Union composition without the marker, general
+`anyOf`/`oneOf`/`allOf` changes, and `x-kubernetes-validations` (CEL) rule
+changes are not compared: a compatible report is a static schema signal, not a
+full compatibility guarantee.
+
 The check is static and does not replace conversion, admission, or upgrade
 tests. It gives provider pull requests an early, reproducible compatibility
 signal without a cluster.
